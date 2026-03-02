@@ -11,6 +11,7 @@ import aiohttp
 
 import os
 import logging
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -90,8 +91,7 @@ if tts_type == "qwen":
         ref_text="",
         language="English"
     )
-    logger.info("Pre-loading local Qwen3 TTS model + CUDA graphs...")
-    TTS_PLUGIN.warmup()
+    logger.info("Local Qwen3 TTS singleton created.")
 
 elif tts_type == "cartesia":
     logger.info("Using Cartesia Cloud TTS (Sonic-3)")
@@ -106,6 +106,21 @@ else:
     TTS_PLUGIN = openai.TTS()
 
 server = AgentServer()
+
+@server.on("worker_started")
+def on_worker_init():
+    """Warms up the TTS model once when the worker starts (survives across sessions)."""
+    logger.info("Worker started, warming up TTS...")
+    # Run warmup in a background thread to avoid blocking the main event loop
+    def run_warmup():
+        try:
+            TTS_PLUGIN.warmup()
+        except Exception as e:
+            logger.error(f"TTS warmup failed: {e}")
+
+    threading.Thread(target=run_warmup, daemon=True).start()
+
+
 
 class AssistantFnc(llm.ToolContext):
     @llm.function_tool(description="Search the knowledge base for documents about the user's query.")
