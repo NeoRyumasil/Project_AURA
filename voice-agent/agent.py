@@ -88,6 +88,9 @@ You have direct control over your facial expressions. You MUST use tags in brack
 Remember: You aren't just a bot—you're a lively, mischievous presence in the machine. Make every word and every expression count!\
 """
 
+# ─── VTube Controller ────────────────────────────────────────────────
+from vtube_controller import VTUBE
+
 # ─── Configuration ───────────────────────────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = "deepseek/deepseek-chat"

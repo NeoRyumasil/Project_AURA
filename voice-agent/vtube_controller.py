@@ -22,8 +22,12 @@ class VTubeController:
             "authentication_token_path": token_path
         }
         self.vts = None
-        self.connected = False
+        self.is_enabled = os.getenv("VTUBE_ENABLED", "false").lower() == "true"
         self._connected_loop = None  # Track which event loop owns the VTS connection
+        
+        if not self.is_enabled:
+            logger.info("VTube Studio integration is DISABLED via .env")
+            return
         
         # Expression mapping (matches hotkey names or filenames in VTube Studio)
         self.expressions = {
@@ -99,6 +103,9 @@ class VTubeController:
     
     async def connect(self):
         """Connect to VTube Studio with robust re-authentication."""
+        if not self.is_enabled:
+            return False
+            
         current_loop = asyncio.get_event_loop()
         
         # If we're on a different event loop, force reconnect (LiveKit forks new processes)
@@ -217,9 +224,12 @@ class VTubeController:
     
     BASE_EMOTIONS = ["happy", "sad", "smile", "angry", "ghost", "ghost_nervous"]
 
-    async def set_expression(self, expression_names: list[str] | str):
+    async def set_expression(self, expression_names, reset_after=None):
         """Set one or more expressions by name. 
         Enforces mutual exclusivity for base emotions (happy, sad, etc.)."""
+        if not self.is_enabled:
+            return
+            
         if not self.connected or not self.vts:
             logger.info("VTube Studio not connected. Attempting to reconnect...")
             if not await self.connect():
@@ -281,8 +291,11 @@ class VTubeController:
                 logger.error(f"Failed to trigger expression {expression_name}: {e}")
                 self.connected = False
     
-    def detect_emotion(self, text: str) -> list[str]:
+    def detect_emotion(self, text):
         """Bilingual detection: Looks for explicit tags [tag1, tag2] first, then falls back to keywords."""
+        if not self.is_enabled:
+            return []
+            
         text_lower = text.lower()
         
         # 1. Look for explicit tags in brackets [happy, pupil_shrink]
