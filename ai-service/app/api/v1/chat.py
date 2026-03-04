@@ -7,21 +7,17 @@ router = APIRouter()
 
 @router.post("", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    # Convert history dicts to LangChain messages
-    history = []
-    for msg in request.history or []:
-        if msg['role'] == 'user':
-            history.append(HumanMessage(content=msg['content']))
-        else:
-            history.append(AIMessage(content=msg['content']))
-            
-    # Add current message
-    history.append(HumanMessage(content=request.message))
-    
     # Run Graph
     try:
-        initial_state = {"messages": history, "emotion": "neutral"}
-        config = {"configurable": {"thread_id": request.session_id or "default"}}
+        session_id = request.session_id or "default"
+        
+        initial_state = {
+            "messages":   [HumanMessage(content=request.message)],
+            "emotion":    "neutral",
+            "session_id": session_id,
+        }
+
+        config = {"configurable": {"thread_id": session_id}}
         result = brain.invoke(initial_state, config=config)
         
         # Extract response
@@ -37,6 +33,7 @@ async def chat(request: ChatRequest):
                         "name": tc.get("name"),
                         "args": tc.get("args", {})
                     })
+                    
         # Clean tags
         text = last_msg
         if text.startswith("["):
