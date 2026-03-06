@@ -3,11 +3,14 @@ Memory service using Supabase pgvector for semantic search.
 Replaces the previous Qdrant-based implementation — zero Docker containers needed.
 """
 from __future__ import annotations
+from typing import List
 from supabase import create_client
 from langchain_openai import OpenAIEmbeddings
 from app.core.config import settings
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from uuid import UUID
+
+from app.models.database import (Conversation, CreateConversation, Message, CreateMesssage, Memory, CreateMemory)
 
 import logging
 import threading
@@ -16,33 +19,8 @@ logger = logging.getLogger(__name__)
 
 session_ttl_minutes = 120
 
-@dataclass
-class Interaction:
-    role : str
-    content : str
-    emotion : str
-    timestamp : datetime = field(default_factory=datetime.now)
-
-    def inject_to_llm(self) -> dict:
-        return {"role" : self.role, "content" : self.content}
-
-
-@dataclass
-class SessionStore:
-    interactions: list[Interaction] = field(default_factory=list)
-    last_active: datetime = field(default_factory=datetime.now)
-
-    def set_last_active(self):
-        self.last_active = datetime.now()
-
-    def is_expired(self, ttl: int) -> bool:
-        return datetime.now() - self.last_active > timedelta(minutes=ttl)
-
 class MemoryService:
     def __init__(self, max_session_interaction: int = 200):
-        self.session: dict[str, SessionStore] = {}
-        self.lock = threading.Lock()
-        self.max_session = max_session_interaction
         self.client = None
         self.embeddings = None
 
@@ -64,67 +42,132 @@ class MemoryService:
         else:
             logger.warning("OPENROUTER_API_KEY not set. Memory embedding disabled.")
 
-    def get_create_session(self, session_id:str) -> SessionStore:
-        if session_id not in self.session:
-            self.session[session_id] = SessionStore()
-            logger.info(f"MemoryService: new session: {session_id[:8]}")
+    async def create_conversation(self, title: str = "New Conversation") -> UUID | None:
+        if not self.client:
+            return None
         
-        store = self.session[session_id]
-        store.set_last_active()
-        return store
-    
-    def clean_expired(self):
-        expired = [session_id for session_id, store in self.session.items()
-                   if store.is_expired(session_ttl_minutes)]
+        try:
+            result = self.client.table("conversations").insert(
+                CreateConversation(title=title).model_dump()
+            ).execute()
 
-        for session_id in expired:
-            del self.session[session_id]
-            logger.info(f"MemoryService: expired session '{session_id[:8]}…' removed.")
-
-    def add_interaction(self, session_id: str, user_text : str, assistant_text : str, user_emotion: str = "neutral", assistant_emotion: str = "neutral") -> None:
-        with self.lock:
-            self.clean_expired()
-            store = self.get_create_session(session_id)
-            store.interactions.append(Interaction("user", user_text, user_emotion))
-            store.interactions.append(Interaction("assistant", assistant_text, assistant_emotion))
-
-            if len(store.interactions) > self.max_session:
-                store.interactions = store.interactions[-self.max_session:]
+            if result.data:
+                return UUID(result.data[0]["id"])
+            else:
+                return None
+        
+        except Exception as error:
+            logger.error(f"Memory Service Create Conversation Error: {error}")
+            return None
     
-    def get_messages_in_session(self, session_id: str, n: int = 20) -> list[dict]:
-        if n <= 0 :
-            return []
+    async def get_conversation(self, conversation_id: UUID) -> Conversation | None:
+        if not self.client:
+            return None
         
-        with self.lock:
-            store = self.get_create_session(session_id)
-            return [message.inject_to_llm() for message in store.interactions[-n:]]
-        
-    def get_last_n(self, session_id: str, n: int) -> list[Interaction]:
-        if n <= 0:
-            return []
-        
-        with self.lock:
-            store = self._get_or_create(session_id)
-            return list(store.interactions[-n:])
-    
-    def count_session(self, session_id: str) -> int:
-        with self.lock:
-            if session_id not in self._sessions:
-                return 0
+        try:
+            result = self.client.table("conversations") \
+                .select("*") \
+                .eq("id", str(conversation_id)) \
+                .single() \
+                .execute()
             
-            return len(self.session[session_id].interactions)
+            if result.data:
+                return Conversation(**result.data)
+            else:
+                return None
+        
+        except Exception as error:
+            logger.error(f"Memory Service Get Conversation Error: {error}")
+            return None
     
-    def clear_session(self, session_id: str) -> None:
-       with self.lock:
-            if session_id in self._sessions:
-                del self.session[session_id]
+    async def add_interaction(self, conversation_id: UUID, user_text: str, assistant_text: str, user_emotion: str = "neutral", assistant_emotion: str = "neutral") -> None:
+        if not self.client:
+            return None
 
-            logger.info(f"MemoryService: session '{session_id[:8]}…' cleared.")
+        try:
+            self.client.table("messages").insert([
+                CreateMesssage(
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=user_text,
+                    emotion=user_emotion,
+                ).model_dump(mode="json"),
+
+                CreateMesssage(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=assistant_text,
+                    emotion=assistant_emotion
+                ).model_dump(mode="json")
+            ]).execute() 
+
+            self.client.table("conversations") \
+                .update({"updated_at": "now()"}) \
+                .eq("id", str(conversation_id)) \
+                .execute()
+
+        except Exception as error:
+            logger.error(f"Memory Service Add Interaction Error: {error}")
+
+    async def get_history(self, conversation_id: UUID, n: int = 30) -> List[Message]:
+        if not self.client or n <= 0:
+            return []     
+        
+        try:
+            result = self.client.table("messages") \
+                        .select("role, content, emotion, created_at") \
+                        .eq("conversation_id", str(conversation_id)) \
+                        .order("created_at", desc=True) \
+                        .limit(n) \
+                        .execute()
+            
+            rows = result.data or []
+            rows.reverse()
+            
+            return [{"role": row["role"], "content": row["content"], "emotion": row["emotion"]} for row in rows]
+        
+        except Exception as error:
+            logger.error(f"Memory Service Get History Error : {error}")
+            return []
     
-    def active_session(self) -> int:
-        with self.lock:
-            return len(self.session)
+    async def get_last_n_message(self, conversation_id: UUID, n: int) -> List[Message]:
+        if not self.client or n <= 0:
+            return []     
+        
+        try:
+            result = self.client.table("messages") \
+                .select("id, role, content, emotion, created_at") \
+                .eq("conversation_id", str(conversation_id)) \
+                .order("created_at", desc=True) \
+                .limit(n) \
+                .execute()
 
+            rows = result.data or []
+            rows.reverse()
+            return rows
+        
+        except Exception as error:
+            logger.error(f"Memory Service Get Last N Message Error: {error}")
+            return []
+
+    async def get_summary(self, conversation_id: UUID, n: int = 20) -> List[Message]:
+        return await self.get_last_n_message(conversation_id, n)
+
+    async def clear_conversation(self, conversation_id: UUID) -> None:
+        if not self.client:
+            return []
+
+        try:
+            self.client.table("messages") \
+                .delete() \
+                .eq("conversation_id", str(conversation_id)) \
+                .execute()
+
+            logger.info(f"Memory Service: Conversation {conversation_id} Cleared.")
+
+        except Exception as error:
+            logger.error(f"Memory Service Clear Conversation Error: {error}")           
+            
     async def store(self, text: str, metadata: dict = None):
         """Embed and store a memory in Supabase pgvector."""
         if not self.client or not self.embeddings or not text.strip():
