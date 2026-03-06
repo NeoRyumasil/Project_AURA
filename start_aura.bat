@@ -14,23 +14,6 @@ taskkill /F /FI "WINDOWTITLE eq AURA AI Service" /T >nul 2>&1
 taskkill /F /FI "WINDOWTITLE eq AURA Dashboard" /T >nul 2>&1
 timeout /t 1 /nobreak >nul
 
-:: ─── Python Version Check ──────────────────
-for /f "tokens=2 delims= " %%v in ('python --version') do set "PY_VER=%%v"
-for /f "tokens=1,2 delims=." %%a in ("%PY_VER%") do (
-    set "PY_MAJOR=%%a"
-    set "PY_MINOR=%%b"
-)
-
-if %PY_MAJOR% equ 3 (
-    if %PY_MINOR% geq 13 (
-        echo [WARNING] Detected Python %PY_VER%.
-        echo Python 3.13+ has compatibility issues with CUDA/PyTorch in this project.
-        echo Please use Python 3.10, 3.11, or 3.12 (RECOMMENDED).
-        echo.
-        timeout /t 5
-    )
-)
-
 :: ─── 0. Setup Virtual Environments ──────────
 echo [0/4] Checking environments...
 
