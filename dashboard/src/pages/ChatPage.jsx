@@ -98,7 +98,7 @@ export default function ChatPage() {
             const res = await fetch(`${AI_SERVICE}/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: text, history }),
+                body: JSON.stringify({ message: text, conversation_id: convoId }),
             })
             const data = await res.json()
             console.log('[AURA] AI Response:', data)

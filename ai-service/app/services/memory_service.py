@@ -17,10 +17,8 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-session_ttl_minutes = 120
-
 class MemoryService:
-    def __init__(self, max_session_interaction: int = 200):
+    def __init__(self):
         self.client = None
         self.embeddings = None
 
@@ -124,7 +122,7 @@ class MemoryService:
             rows = result.data or []
             rows.reverse()
             
-            return [{"role": row["role"], "content": row["content"], "emotion": row["emotion"]} for row in rows]
+            return [{"role": "assistant" if row["role"] == "aura" else row["role"], "content": row["content"]} for row in rows]
         
         except Exception as error:
             logger.error(f"Memory Service Get History Error : {error}")
