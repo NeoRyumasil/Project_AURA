@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 import numpy as np
 from vtube_controller import VTUBE
+from avatar_bridge import BRIDGE
 
 from livekit import rtc
 from livekit.agents import tts, tokenize
@@ -277,15 +278,22 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
                         try:
                             if delay_start > 0:
                                 await asyncio.sleep(delay_start)
-                                
+
                             if em_list:
-                                await VTUBE.set_expression(em_list)
-                                
+                                # Fire both simultaneously — BRIDGE never waits for VTS's sleeps
+                                await asyncio.gather(
+                                    VTUBE.set_expression(em_list),
+                                    BRIDGE.send_expression(em_list, dur),
+                                )
+
                             await asyncio.sleep(dur + 0.3)  # grace period after audio
-                            
+
                             # Only clear to neutral if we are STILL the very last scheduled sentence
                             if getattr(self, '_reset_token', -1) == token:
-                                await VTUBE.reset_to_neutral()
+                                await asyncio.gather(
+                                    VTUBE.reset_to_neutral(),
+                                    BRIDGE.send_neutral(),
+                                )
                         except Exception as e:
                             logger.debug(f"VTS sync error (non-fatal): {e}")
 

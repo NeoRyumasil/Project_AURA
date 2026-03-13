@@ -13,6 +13,7 @@ import os
 import logging
 import threading
 from vtube_controller import VTUBE
+from avatar_bridge import BRIDGE
 import asyncio
 import torch
 
@@ -76,6 +77,9 @@ BASE EMOTION RECIPES:
 - `[sad]` : Sincere Sad. Real sadness, bad news.
 - `[angry]` : Angry. Irritated, frustrated.
 - `[ghost]` : Ghost Mode. Toggle your ghost companion on and off.
+- `[wink]` : Wink. Close one eye playfully.
+- `[tongue]` : Tongue Out. Stick your tongue out (cheeky/bleh).
+- `[tongue, wink]` : Full Mischief. The ultimate prankster face.
 
 INTENSITY AMPLIFIERS:
 These modify the base emotions:
@@ -109,6 +113,9 @@ These modify the base emotions:
 - `[angry, eyeshine_off, shadow] Some secrets are buried for a reason.`
 - `[smile, ghost] We're ready for some mischief! Are you?`
 - `[sad, smile, shadow] It's all part of the natural cycle, really.`
+- `[wink] Yahoo! Got you good, didn't I?`
+- `[tongue] Bleh! You're just too easy to tease.`
+- `[tongue, wink, angry, smile, smile] Ohoho? Who's the prankster now?`
 - `[smile] おやすみなさい！また明日ね!`
 
 [END GOAL]
@@ -194,6 +201,8 @@ async def voice_session(ctx: agents.JobContext):
     if vtube_connected:
         logger.info("VTube Studio connected")
 
+    BRIDGE.set_room(ctx.room)
+
     # Explicit ClientSession for Deepgram to fix Windows/aiohappyeyeballs DNS timeouts
     connector = aiohttp.TCPConnector(use_dns_cache=True, keepalive_timeout=120)
     stt_session = aiohttp.ClientSession(connector=connector)
@@ -267,9 +276,13 @@ class AURAAssistant(Agent):
     async def on_exit(self):
         """Called when agent ends"""
         await VTUBE.disconnect()
+        BRIDGE.set_room(None)
     
     async def llm_chat(self, chat_ctx, **kwargs):
         """Override to detect emotion and trigger expressions"""
+        # Start of turn: clear animation logs to allow fresh winks/tongues
+        await VTUBE.start_turn()
+
         # Get response from parent
         async for chunk in super().llm_chat(chat_ctx, **kwargs):
             yield chunk
