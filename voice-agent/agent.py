@@ -127,7 +127,7 @@ from vtube_controller import VTUBE
 
 # ─── Configuration ───────────────────────────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "deepseek/deepseek-chat"
+OPENROUTER_MODEL = "deepseek/deepseek-v3.2"
 
 # ─── TTS Plugin (module-level singleton — survives across sessions) ──
 tts_type = os.getenv("TTS_TYPE", "qwen").lower()
