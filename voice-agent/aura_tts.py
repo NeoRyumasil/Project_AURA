@@ -136,7 +136,6 @@ class AuraTTS(tts.TTS):
     def stream(self, *, conn_options=None) -> "tts.SynthesizeStream":
         return _AuraSynthesizeStream(self, self._opts, conn_options)
 
-
 class _AuraChunkedStream(tts.ChunkedStream):
     """Non-streaming: synthesize a complete text string."""
 
@@ -163,8 +162,6 @@ class _AuraChunkedStream(tts.ChunkedStream):
             None, self._tts_instance._generate_audio, self._text
         )
         output_emitter.push(pcm_bytes)
-
-
 
 class _AuraSynthesizeStream(tts.SynthesizeStream):
     """Streaming: buffers LLM text into sentences, synthesizes each as one continuous audio stream."""
@@ -249,9 +246,10 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
                             async def _reset_after(ems, dur):
                                 await asyncio.sleep(dur)
                                 try:
-                                    await VTUBE.set_expression(ems)
+                                    await VTUBE.set_expression(["neutral"])
                                 except Exception:
                                     pass
+                                
                             asyncio.create_task(_reset_after(emotions, duration))
                         except Exception as ve:
                             logger.debug(f"VTS expression error (non-fatal): {ve}")

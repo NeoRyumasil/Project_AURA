@@ -22,6 +22,7 @@ class VTubeController:
             "authentication_token_path": token_path
         }
         self.vts = None
+        self.connected = False
         self.is_enabled = os.getenv("VTUBE_ENABLED", "false").lower() == "true"
         self._connected_loop = None  # Track which event loop owns the VTS connection
         
