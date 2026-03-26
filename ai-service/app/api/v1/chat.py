@@ -1,27 +1,32 @@
+import re
+import logging
+
 from fastapi import APIRouter, HTTPException
+from app.services.memory_service import memory_service
 from app.models.chat import ChatRequest, ChatResponse
 from app.services.brain.graph import brain
 from langchain_core.messages import HumanMessage, AIMessage
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 @router.post("", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    # Convert history dicts to LangChain messages
-    history = []
-    for msg in request.history or []:
-        if msg['role'] == 'user':
-            history.append(HumanMessage(content=msg['content']))
-        else:
-            history.append(AIMessage(content=msg['content']))
-            
-    # Add current message
-    history.append(HumanMessage(content=request.message))
-    
     # Run Graph
     try:
-        initial_state = {"messages": history, "emotion": "neutral"}
-        config = {"configurable": {"thread_id": request.session_id or "default"}}
+        conversation_id = request.conversation_id
+        
+        if not conversation_id:
+            new_id = await memory_service.create_conversation()
+            conversation_id = str(new_id) if new_id else "default"
+        
+        initial_state = {
+            "messages":   [HumanMessage(content=request.message)],
+            "emotion":    "neutral",
+            "conversation_id": conversation_id,
+        }
+
+        config = {"configurable": {"thread_id": conversation_id}}
         result = brain.invoke(initial_state, config=config)
         
         # Extract response
@@ -37,10 +42,10 @@ async def chat(request: ChatRequest):
                         "name": tc.get("name"),
                         "args": tc.get("args", {})
                     })
+                    
         # Clean tags
         text = last_msg
         if text.startswith("["):
-             import re
              match = re.match(r'^\[(.*?)\]', text)
              if match:
                  text = text[match.end():].strip()
@@ -48,9 +53,15 @@ async def chat(request: ChatRequest):
         return ChatResponse(
             text=text,
             emotion=emotion,
+            conversation_id=conversation_id,
             tools_used=tools_used if tools_used else None
         )
+    
     except Exception as e:
+        logger.error(f"Chat error: {e}")
+
         return ChatResponse(
-             text=f"Brain Freeze: {str(e)}",
+            text=f"Brain Freeze: {str(e)}",
+            emotion="confused",
+            conversation_id=request.conversation_id or "default",
         )

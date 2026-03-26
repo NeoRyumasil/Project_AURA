@@ -167,7 +167,6 @@ class AuraTTS(tts.TTS):
     def stream(self, *, conn_options=None) -> "tts.SynthesizeStream":
         return _AuraSynthesizeStream(self, self._opts, conn_options)
 
-
 class _AuraChunkedStream(tts.ChunkedStream):
     """Non-streaming: synthesize a complete text string."""
 
@@ -194,8 +193,6 @@ class _AuraChunkedStream(tts.ChunkedStream):
             None, self._tts_instance._generate_audio, self._text
         )
         output_emitter.push(pcm_bytes)
-
-
 
 class _AuraSynthesizeStream(tts.SynthesizeStream):
     """Streaming: buffers LLM text into sentences, synthesizes each as one continuous audio stream."""

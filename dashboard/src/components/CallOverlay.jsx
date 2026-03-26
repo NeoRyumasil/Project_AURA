@@ -1,6 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { AvatarRenderer } from './AvatarRenderer'
 
+function getOrCreateIdentity(){
+    const KEY = 'aura_user_identity'
+    let id = localStorage.getItem(KEY)
+
+    if (!id){
+        id = `user-${crypto.randomUUID().slice(0,8)}`
+        localStorage.setItem(KEY, id)
+    }
+
+    return id
+}
+
 export default function CallOverlay({ onClose }) {
     const [status, setStatus] = useState('connecting')
     const [elapsed, setElapsed] = useState(0)
@@ -23,9 +35,11 @@ export default function CallOverlay({ onClose }) {
             try {
                 // Dynamically import to avoid bundling when not needed
                 const { Room, RoomEvent, Track } = await import('livekit-client')
+                
+                const identity = getOrCreateIdentity()
 
                 // Fetch token from token server
-                const res = await fetch(`http://${window.location.hostname}:8082/getToken`)
+                const res = await fetch(`http://${window.location.hostname}:8082/getToken?room=aura-room&identity=${encodeURIComponent(identity)}`)
                 if (!res.ok) throw new Error(`Token server error: ${res.status}`)
                 const { token, url } = await res.json()
 
