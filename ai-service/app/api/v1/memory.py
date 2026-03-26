@@ -41,7 +41,6 @@ async def upload_memory(file: UploadFile = File(...)):
 
     # 3. Store Vectors
     count = 0
-    await memory_service.ensure_collection()
     
     for chunk in chunks:
         await memory_service.store(

@@ -83,49 +83,33 @@ export default function ChatPage() {
             setConversations((prev) => [data, ...prev])
         }
 
-        // Save user message
-        const { data: userMsg } = await supabase
-            .from('messages')
-            .insert({ conversation_id: convoId, role: 'user', content: text })
-            .select()
-            .single()
-        if (userMsg) setMessages((prev) => [...prev, userMsg])
+        // Optimistically show user message in UI (backend saves to DB)
+        const tempUserMsg = { id: `temp-${Date.now()}`, role: 'user', content: text, conversation_id: convoId }
+        setMessages((prev) => [...prev, tempUserMsg])
 
-        // Call ai-service
+        // Call ai-service — backend handles ALL DB saves
         setIsSending(true)
         try {
-            const history = messages.map((m) => ({ role: m.role === 'aura' ? 'assistant' : m.role, content: m.content }))
             const res = await fetch(`${AI_SERVICE}/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: text, history }),
+                body: JSON.stringify({ message: text, conversation_id: convoId }),
             })
             const data = await res.json()
             console.log('[AURA] AI Response:', data)
 
-            // Save AI response
-            const { data: aiMsg } = await supabase
-                .from('messages')
-                .insert({
-                    conversation_id: convoId,
-                    role: 'aura',
-                    content: data.text || 'Hmm, the words escaped me~',
-                    emotion: data.emotion || 'neutral',
-                })
-                .select()
-                .single()
-
-            console.log('[AURA] Supabase Insert Result:', aiMsg)
-
-            if (aiMsg) {
-                const localMsg = { ...aiMsg }
-                if (data.tools_used && data.tools_used.length > 0) {
-                    localMsg.tools_used = data.tools_used
-                }
-                setMessages((prev) => [...prev, localMsg])
+            // Show AI response in UI (backend already saved to DB)
+            const tempAiMsg = {
+                id: `temp-ai-${Date.now()}`,
+                role: 'aura',
+                content: data.text || 'Hmm, the words escaped me~',
+                emotion: data.emotion || 'neutral',
+                conversation_id: convoId,
+                tools_used: data.tools_used || null,
             }
+            setMessages((prev) => [...prev, tempAiMsg])
 
-            // Update conversation title + timestamp
+            // Update conversation title on first message
             if (messages.length === 0) {
                 await supabase
                     .from('conversations')
@@ -135,17 +119,12 @@ export default function ChatPage() {
             }
         } catch (err) {
             console.error('[AURA] Chat error:', err)
-            const { data: errMsg } = await supabase
-                .from('messages')
-                .insert({
-                    conversation_id: convoId,
-                    role: 'aura',
-                    content: "Hmm, my connection to the other side seems shaky right now~ Try again?",
-                    emotion: 'dizzy',
-                })
-                .select()
-                .single()
-            if (errMsg) setMessages((prev) => [...prev, errMsg])
+            setMessages((prev) => [...prev, {
+                id: `temp-err-${Date.now()}`,
+                role: 'aura',
+                content: "Hmm, my connection to the other side seems shaky right now~ Try again?",
+                emotion: 'dizzy',
+            }])
         } finally {
             setIsSending(false)
         }

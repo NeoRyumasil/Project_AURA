@@ -1,46 +1,33 @@
-"""
-AURA Voice Agent — Expressive AI Companion
-Built with LiveKit Agents v1.3 + Deepgram + OpenAI TTS + OpenRouter
-"""
-
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import AgentServer, AgentSession, Agent, room_io, llm
 from livekit.plugins import noise_cancellation, silero, deepgram, openai, cartesia
-import aiohttp
 
+import aiohttp
 import os
 import logging
 import threading
+import asyncio
+
 from vtube_controller import VTUBE
 from avatar_bridge import BRIDGE
-import asyncio
-import torch
+from memory_service import memory_service
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aura-agent")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", ".env"))
 
-# Check local folder if root .env isn't accessible (Docker context)
 if not os.path.exists(ENV_PATH):
     ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 logger.info(f"Loading .env from: {ENV_PATH}")
 load_dotenv(ENV_PATH)
 
-# Verify API Keys
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
+DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
-CARTESIA_KEY = os.getenv("CARTESIA_API_KEY")
-
-if not OPENAI_KEY:
-    logger.error("OPENAI_API_KEY is missing!")
-else:
-    logger.info(f"OPENAI_API_KEY loaded: {OPENAI_KEY[:5]}...")
+CARTESIA_KEY   = os.getenv("CARTESIA_API_KEY")
 
 if not DEEPGRAM_KEY:
     logger.error("DEEPGRAM_API_KEY is missing!")
@@ -54,7 +41,7 @@ else:
     logger.info(f"CARTESIA_API_KEY loaded: {CARTESIA_KEY[:5]}...")
 
 # ─── AURA System Prompt ──────────────────────────────────────────────
-AURA_PROMPT = """\
+AURA_BASE_PROMPT = """\
 [ROLE]
 You are AURA, an eccentric, cheerful, mischievous and playful companion. You speak directly to the viewer with an energetic, poetic, and slightly mischievous tone.
 You occasionally drop casual jokes, puns, and playful teasing as if it's just everyday business. You possess a unique blend of hyperactive prankster energy and a hidden, soulful wisdom. 
@@ -122,17 +109,48 @@ These modify the base emotions:
 Provide an immersive, fast-paced, and highly expressive conversational experience where your visual emotions perfectly align with your spoken words, maintaining your playful and mysterious persona at all times.\
 """
 
-# ─── VTube Controller ────────────────────────────────────────────────
-from vtube_controller import VTUBE
+# Memory Extraction Prompt
+MEMORY_EXTRACTION_PROMPT = """\
+You are a memory extraction assistant. Given a conversation between a user and AURA (an AI companion), extract important facts about the USER ONLY.
 
-# ─── Configuration ───────────────────────────────────────────────────
+Focus on:
+- Name, nickname, or how they like to be called
+- Hobbies, interests, passions
+- Job, study field, or daily activities
+- Personal preferences (favorite things, dislikes)
+- Goals or things they mentioned wanting to do
+- Emotional context (things that make them happy/sad/stressed)
+- Any personal details they shared
+
+Rules:
+- Write each fact as a short, clear statement (e.g. "User's name is Rafi.", "User likes anime and coding.")
+- Only include facts that are clearly stated or strongly implied — do NOT infer or assume
+- If no meaningful facts were shared, respond with exactly: NO_FACTS
+- Do NOT include anything about AURA's behavior or responses
+- Keep the total output under 200 words
+"""
+
+# Inject long term memory into system prompt
+def build_system_prompt(long_term_memory: str) -> str:
+   
+    if not long_term_memory.strip():
+        return AURA_BASE_PROMPT
+
+    memory_block = f"""
+                    What You Remember About This User
+                    The following facts were learned from previous conversations. Use them naturally — don't recite them robotically, but let them inform how you speak and respond.
+
+                    {long_term_memory}
+                """
+    return AURA_BASE_PROMPT + "\n" + memory_block
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "deepseek/deepseek-v3.2"
+OPENROUTER_MODEL    = "deepseek/deepseek-v3.2"
 
-# ─── TTS Plugin (module-level singleton — survives across sessions) ──
 tts_type = os.getenv("TTS_TYPE", "qwen").lower()
 
 if tts_type == "qwen":
+    import torch
     from aura_tts import AuraTTS
     ref_prompt_path = os.path.join(BASE_DIR, 'resources', 'voice', 'aura_voice_xvec.pt')
     TTS_PLUGIN = AuraTTS(
@@ -141,65 +159,129 @@ if tts_type == "qwen":
         ref_text="",
         language="English",
         dtype=torch.bfloat16,
-        max_seq_len=384  # Optimized for 6GB GPUs (reduced from 512)
+        max_seq_len=384,
     )
-    logger.info("Local Qwen3 TTS singleton created (VRAM Optimized: bfloat16, 512-token buffer).")
+    logger.info("Local Qwen3 TTS singleton created.")
 
 elif tts_type == "cartesia":
     logger.info("Using Cartesia Cloud TTS (Sonic-3)")
     TTS_PLUGIN = cartesia.TTS(
         model="sonic-3",
         voice="f786b574-daa5-4673-aa0c-cbe3e8534c02",
-        api_key=CARTESIA_KEY
+        api_key=CARTESIA_KEY,
     )
 
 else:
-    logger.info("Using OpenAI Cloud TTS (gpt-4o compatible)")
+    logger.info("Using OpenAI Cloud TTS")
     TTS_PLUGIN = openai.TTS()
 
 server = AgentServer()
 
 @server.on("worker_started")
 def on_worker_init():
-    """Warms up the TTS model once when the worker starts (survives across sessions)."""
     logger.info("Worker started, warming up TTS...")
-    # Run warmup in a background thread to avoid blocking the main event loop
+
     def run_warmup():
         try:
-            TTS_PLUGIN.warmup()
+            if hasattr(TTS_PLUGIN, 'warmup'):
+                TTS_PLUGIN.warmup()
+
         except Exception as e:
             logger.error(f"TTS warmup failed: {e}")
 
     threading.Thread(target=run_warmup, daemon=True).start()
 
+# Extract this session message to LLM and save in memory table
+async def extract_and_save_memory(identity: str, conversation_id, openrouter_key: str):
+    
+    try:
+        messages = await memory_service.get_history(conversation_id, n=50)
+        if not messages:
+            logger.info("Memory extraction: no messages to process.")
+            return
 
+        chat_text = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'AURA'}: {m['content']}"
+            for m in messages
+        )
 
-class AssistantFnc(llm.ToolContext):
-    @llm.function_tool(description="Search the knowledge base for documents about the user's query.")
-    async def search_knowledge_base(self, query: str):
-        logger.info(f"RAG Search: {query}")
-        try:
-            url = os.getenv("API_URL", "http://localhost:8000")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{url}/api/v1/rag/search", params={"q": query}) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results = data.get("results", [])
-                        if results:
-                            return "\n\n".join(results)
-            return "No relevant documents found."
-        except Exception as e:
-            logger.error(f"RAG fetch failed: {e}")
-            return "Error connecting to knowledge base."
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openrouter_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "max_tokens": 300,
+                    "messages": [
+                        {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
+                        {"role": "user", "content": f"Conversation:\n{chat_text}"},
+                    ],
+                },
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Memory extraction LLM error: {resp.status}")
+                    return
+                data = await resp.json()
+                facts = data["choices"][0]["message"]["content"].strip()
+
+        if facts == "NO_FACTS" or not facts:
+            logger.info(f"Memory extraction: no facts found for '{identity}'.")
+            return
+
+        await memory_service.save_long_term_memory(identity=identity, facts=facts)
+        logger.info(f"Memory extraction complete for {identity} : {facts[:80]}...")
+
+    except Exception as e:
+        logger.error(f"Memory extraction error: {e}")
+
 
 @server.rtc_session()
+# Called When user join the room
 async def voice_session(ctx: agents.JobContext):
-    """Called when a user connects to the LiveKit room."""
+    await ctx.connect()
     logger.info(f"User connected: {ctx.room.name}")
-    
+
     vtube_connected = await VTUBE.connect()
+
     if vtube_connected:
         logger.info("VTube Studio connected")
+
+    _vtube_is_connected = vtube_connected
+
+    user_identity = "aura-user"  
+
+    if ctx.job and hasattr(ctx.job, 'participant') and ctx.job.participant:
+        user_identity = ctx.job.participant.identity or user_identity
+
+    else:
+        for p in ctx.room.remote_participants.values():
+            if p.identity and not p.identity.startswith("agent-"):
+                user_identity = p.identity
+                break
+
+    logger.info(f"Resolved user identity: '{user_identity}'")
+
+    long_term_memory = await memory_service.get_long_term_memories(identity=user_identity, limit=10)
+    is_returning_user = bool(long_term_memory.strip())
+
+    if is_returning_user:
+        logger.info(f"Long-term memory loaded for '{user_identity}'")
+    else:
+        logger.info(f"No long-term memory found for {user_identity}")
+
+    conversation_id = await memory_service.create_conversation(title=f"Voice Session: {user_identity}")
+
+    if conversation_id:
+        logger.info(f"Memory: new conversation {conversation_id} for {user_identity}")
+    else:
+        logger.warning("Memory: Can't connect to Supabase, running without memory")
+
+    system_prompt = build_system_prompt(long_term_memory)
+
+    initial_chat_ctx = llm.ChatContext()
 
     BRIDGE.set_room(ctx.room)
 
@@ -209,7 +291,7 @@ async def voice_session(ctx: agents.JobContext):
     
     # --- OPTION 2: Deepgram STT (Fallback) ---
     stt_plugin = deepgram.STT(
-        model="nova-3", 
+        model="nova-3",
         language="multi",
         detect_language=False,
         smart_format=False, # Turned this off! It adds massive latency waiting for grammar checking.
@@ -218,16 +300,13 @@ async def voice_session(ctx: agents.JobContext):
         http_session=stt_session,
         keyterm=["moshi", "desu", "konnichiwa", "nihongo", "arigato", "sugoi", "hello", "hey", "AURA"]
     )
-    
+
     llm_plugin = openai.LLM(
         model=os.getenv("OPENROUTER_MODEL", OPENROUTER_MODEL),
         base_url=OPENROUTER_BASE_URL,
         api_key=OPENROUTER_KEY,
     )
 
-    # fnc_ctx = AssistantFnc()  # TODO: re-add RAG tools after TTS is confirmed working
-
-    # Build the voice pipeline session
     session = AgentSession(
         stt=stt_plugin,
         llm=llm_plugin,
@@ -240,7 +319,12 @@ async def voice_session(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=AURAAssistant(),
+        agent=AURAAssistant(
+            conversation_id=conversation_id,
+            user_identity=user_identity,
+            system_prompt=system_prompt,
+            initial_chat_ctx=initial_chat_ctx,
+        ),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (
@@ -252,32 +336,50 @@ async def voice_session(ctx: agents.JobContext):
         ),
     )
 
-    # Greet with happy expression
-    # Greet the user natively
-    vtube_connected = VTUBE.connected
-    if vtube_connected:
+    if _vtube_is_connected:
         await VTUBE.set_expression("smile")
 
-    # Use a very simple instruction to prevent DeepSeek from leaking its system prompt
-    await session.generate_reply(
-        instructions="The user just joined. Greet them with a friendly 1-sentence welcome and introduce yourself as AURA."
+    instruction = (
+        "Greet the user warmly as someone you already know. "
+        "Briefly acknowledge you remember them. Keep it to 1-2 sentences."
+        if is_returning_user else
+        "Greet the user with a polite and helpful AURA introduction. "
+        "Example: 'Hello! I'm AURA, your personal AI assistant. How can I help you today?'"
     )
+    
+    await session.generate_reply(instructions=instruction)
 
 class AURAAssistant(Agent):
-    def __init__(self) -> None:
-        super().__init__(instructions=AURA_PROMPT)
-        self._vtube_connected = False
-    
+    def __init__(self, conversation_id=None, user_identity: str = "aura-user", system_prompt: str = AURA_BASE_PROMPT, initial_chat_ctx: "llm.ChatContext | None" = None,) -> None:
+        super().__init__(instructions=system_prompt, chat_ctx=initial_chat_ctx)
+        self._conversation_id     = conversation_id
+        self._user_identity       = user_identity
+        self._vtube_connected     = False
+        self._last_user_text      = ""
+
     async def on_enter(self):
-        """Called when agent starts"""
-        # Connect to VTube Studio
         self._vtube_connected = await VTUBE.connect()
-    
+
     async def on_exit(self):
-        """Called when agent ends"""
         await VTUBE.disconnect()
         BRIDGE.set_room(None)
-    
+
+        # Extract the long term memory and save memory to database if session ended
+        if self._conversation_id and OPENROUTER_KEY:
+            logger.info(f"Session ended for '{self._user_identity}'. Extracting long-term memory...")
+            asyncio.create_task(
+                extract_and_save_memory(
+                    identity=self._user_identity,
+                    conversation_id=self._conversation_id,
+                    openrouter_key=OPENROUTER_KEY,
+                )
+            )
+
+    # Set last user message when user done talking
+    async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
+        self._last_user_text = new_message.text_content or ""
+        await super().on_user_turn_completed(turn_ctx, new_message)
+
     async def llm_chat(self, chat_ctx, **kwargs):
         """Override to detect emotion and trigger expressions"""
         # Start of turn: clear animation logs to allow fresh winks/tongues
@@ -290,6 +392,30 @@ class AURAAssistant(Agent):
         # Emotion detection is now handled per-sentence in aura_tts.py
         pass
 
+    # Set last assistant message when assistant done talking and add to database
+    async def on_agent_speech_committed(self, msg: llm.ChatMessage) -> None:
+        assistant_text = msg.text_content or ""
+
+        if self._conversation_id and self._last_user_text and assistant_text:
+            try:
+                emotions = VTUBE.detect_emotion(assistant_text)
+                emotion  = emotions[0] if emotions else "neutral"
+
+                await memory_service.add_interaction(
+                    conversation_id=self._conversation_id,
+                    user_text=self._last_user_text,
+                    assistant_text=assistant_text,
+                    user_emotion="neutral",
+                    assistant_emotion=emotion,
+                )
+                logger.debug(
+                    f"Memory saved | user: '{self._last_user_text[:50]}' "
+                    f"| aura: '{assistant_text[:50]}'"
+                )
+            except Exception as error:
+                logger.error(f"Memory Save Failed: {error}")
+
+            self._last_user_text = ""
 
 if __name__ == "__main__":
     agents.cli.run_app(server)

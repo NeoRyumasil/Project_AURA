@@ -1,11 +1,12 @@
 from pydantic import BaseModel
+from typing import Optional
 
 class ChatRequest(BaseModel):
     message: str
-    history: list[dict] | None = None
-    session_id: str = "default"
+    conversation_id: Optional[str] = None 
 
 class ChatResponse(BaseModel):
     text: str
-    emotion: str
+    emotion: str = "neutral"
+    conversation_id: Optional[str] = None
     tools_used: list[dict] | None = None
