@@ -33,6 +33,10 @@ nav:
     - Voice Pipeline: "architecture/VOICE_PIPELINE.md"
     - Memory & RAG: "architecture/AI_MEMORY.md"
   - Developer Guide:
+    - Contribution Flow: "developer/CONTRIBUTING.md"
+    - Frontend Hacking: "developer/FRONTEND.md"
+    - Voice Agent Hacking: "developer/VOICE_AGENT.md"
+    - AI Service Hacking: "developer/AI_SERVICE.md"
     - Customization: "developer/CUSTOMIZATION.md"
     - API Reference: "developer/API_REFERENCE.md"
     - Component Map: "developer/INDEX.md"
