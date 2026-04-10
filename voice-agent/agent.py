@@ -278,17 +278,31 @@ else:
     logger.info("Using OpenAI Cloud TTS")
     TTS_PLUGIN = openai.TTS()
 
-_tts_ready = asyncio.Event()
+_tts_ready_event = asyncio.Event()
 
-async def prewarm(proc: agents.JobProcess):
-    logger.info("Prewarming worker process (TTS warmup)...")
+def _do_tts_warmup(loop: asyncio.AbstractEventLoop):
+    """Sync warmup running in a background thread to avoid blocking process init."""
+    logger.info("Background TTS warmup started...")
     try:
         if hasattr(TTS_PLUGIN, 'warmup'):
-            await TTS_PLUGIN.warmup()
+            TTS_PLUGIN.warmup()
+        logger.info("Background TTS warmup complete.")
     except Exception as e:
-        logger.error(f"TTS warmup failed: {e}")
+        logger.error(f"Background TTS warmup failed: {e}")
     finally:
-        _tts_ready.set()
+        loop.call_soon_threadsafe(_tts_ready_event.set)
+
+def prewarm(proc: agents.JobProcess):
+    """Prewarm the worker process without blocking. 
+    This prevents the 10s LiveKit initialization timeout."""
+    logger.info("Prewarming worker process (scheduling background TTS warmup)...")
+    try:
+        loop = asyncio.get_event_loop()
+        threading.Thread(target=_do_tts_warmup, args=(loop,), daemon=True).start()
+    except Exception as e:
+        logger.error(f"Could not start background prewarm: {e}")
+        # Fallback: set event so session doesn't hang forever
+        _tts_ready_event.set()
 
 _EXTRACT_MAX_ATTEMPTS = 3
 _EXTRACT_BACKOFF_BASE = 2.0  # seconds
@@ -624,9 +638,14 @@ async def voice_session(ctx: agents.JobContext):
         "Example: 'Hello! I'm AURA, your personal AI assistant. How can I help you today?'"
     )
 
-    if not _tts_ready.is_set():
-        logger.info("Waiting for TTS warmup before greeting...")
-        await _tts_ready.wait()
+    # Wait for the background TTS warmup to finish before speaking.
+    # Awaiting the event allows the loop to stay responsive for STT/RTC heartbeats.
+    if not _tts_ready_event.is_set():
+        logger.info("Waiting for background TTS warmup to finish...")
+        try:
+            await asyncio.wait_for(_tts_ready_event.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            logger.warning("TTS warmup timed out after 60s, proceeding anyway...")
 
     if ctx.room.remote_participants:
         logger.info("TTS ready, generating greeting via LLM")

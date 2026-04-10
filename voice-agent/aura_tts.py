@@ -247,10 +247,10 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
 
         tokenizer = tokenize.basic.SentenceTokenizer(min_sentence_len=3)
         token_stream = tokenizer.stream()
+        expr_tasks = set()
 
         async def _process_input():
             """Read text from the input channel and push to the tokenizer."""
-            full_llm_response = ""
             async for data in self._input_ch:
                 if isinstance(data, self._FlushSentinel):
                     token_stream.flush()
@@ -258,7 +258,6 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
                     text = data.replace('。', '. ').replace('！', '! ').replace('？', '? ')
                     token_stream.push_text(text)
             
-            logger.info(f"\n====== FULL LLM RESPONSE ======\n{full_llm_response}\n===============================\n")
             token_stream.end_input()
 
         async def _synthesize():
@@ -324,10 +323,16 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
                                             VTUBE.reset_to_neutral(),
                                             BRIDGE.send_neutral(),
                                         )
+                                except asyncio.CancelledError:
+                                    # Fallback neutral on cancel to be sure
+                                    await asyncio.gather(VTUBE.reset_to_neutral(), BRIDGE.send_neutral())
                                 except Exception as e:
                                     logger.debug(f"Sync error: {e}")
 
-                            asyncio.create_task(_sync_expression(emotions, delay_until_play, duration, current_token))
+                            t = asyncio.create_task(_sync_expression(emotions, delay_until_play, duration, current_token))
+                            expr_tasks.add(t)
+                            t.add_done_callback(expr_tasks.discard)
+                            
                             output_emitter.push(pcm_bytes)
                             logger.debug(f"Synthesized {duration:.2f}s for chunk: '{sentence[:50]}...'")
                             
@@ -336,7 +341,12 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
             finally:
-                # FINAL RESET: Ensure avatar returns to neutral when AURA finishes the whole response
+                # FINAL RESET: Cancel pending expression tasks and return to neutral
+                for t in list(expr_tasks):
+                    t.cancel()
+                if expr_tasks:
+                    await asyncio.gather(*expr_tasks, return_exceptions=True)
+                
                 try:
                     await asyncio.gather(
                         VTUBE.reset_to_neutral(),
