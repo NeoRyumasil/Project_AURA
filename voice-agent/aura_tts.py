@@ -260,76 +260,86 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
 
         async def _synthesize():
             """Read complete sentences from the tokenizer and synthesize with recursive chunking."""
-            async for ev in token_stream:
-                raw_sentence = ev.token
-                
-                # BREAK LONG SENTENCES INTO PIECES to avoid TTS glitches and hit max context
-                text_chunks = _split_text(raw_sentence, max_chars=130)
-
-                for chunk in text_chunks:
-                    # Detect if the chunk is primarily Japanese
-                    has_japanese = any('\u3040' <= char <= '\u30ff' or '\u4e00' <= char <= '\u9fff' for char in chunk)
-                    lang = "Japanese" if has_japanese else "English"
-
-                    # Clean sentence for TTS
-                    sentence = VTUBE.format_for_tts(chunk).rstrip('-~～').strip()
+            try:
+                async for ev in token_stream:
+                    raw_sentence = ev.token
                     
-                    # SAFETY: Skip if sentence contains NO alphanumeric characters
-                    if not any(c.isalnum() for c in sentence):
-                        output_emitter.push(np.zeros(int(1.0 * SAMPLE_RATE), dtype=np.int16).tobytes())
-                        continue
+                    # BREAK LONG SENTENCES INTO PIECES to avoid TTS glitches and hit max context
+                    text_chunks = _split_text(raw_sentence, max_chars=130)
 
-                    loop = asyncio.get_event_loop()
-                    try:
-                        pcm_bytes = await loop.run_in_executor(
-                            None, self._tts_instance._generate_audio_with_lang, sentence, lang
-                        )
+                    for chunk in text_chunks:
+                        # Detect if the chunk is primarily Japanese
+                        has_japanese = any('\u3040' <= char <= '\u30ff' or '\u4e00' <= char <= '\u9fff' for char in chunk)
+                        lang = "Japanese" if has_japanese else "English"
+
+                        # Clean sentence for TTS
+                        sentence = VTUBE.format_for_tts(chunk).rstrip('-~～').strip()
                         
-                        if not pcm_bytes:
+                        # SAFETY: Skip if sentence contains NO alphanumeric characters
+                        if not any(c.isalnum() for c in sentence):
+                            output_emitter.push(np.zeros(int(1.0 * SAMPLE_RATE), dtype=np.int16).tobytes())
                             continue
-                            
-                        duration = len(pcm_bytes) / (SAMPLE_RATE * NUM_CHANNELS * 2)
-                        
-                        # Virtual Playhead syncing
-                        now = time.time()
-                        if not hasattr(self, '_playhead') or self._playhead < now:
-                            self._playhead = now
-                            
-                        self._reset_token = getattr(self, '_reset_token', 0) + 1
-                        current_token = self._reset_token
-                            
-                        delay_until_play = self._playhead - now
-                        self._playhead += duration
-                        
-                        emotions = VTUBE.detect_emotion(chunk)
-                        
-                        async def _sync_expression(em_list, delay_start, dur, token):
-                            try:
-                                if delay_start > 0:
-                                    await asyncio.sleep(delay_start)
 
-                                if em_list:
-                                    await asyncio.gather(
-                                        VTUBE.set_expression(em_list),
-                                        BRIDGE.send_expression(em_list, dur),
-                                    )
+                        loop = asyncio.get_event_loop()
+                        try:
+                            pcm_bytes = await loop.run_in_executor(
+                                None, self._tts_instance._generate_audio_with_lang, sentence, lang
+                            )
+                            
+                            if not pcm_bytes:
+                                continue
+                                
+                            duration = len(pcm_bytes) / (SAMPLE_RATE * NUM_CHANNELS * 2)
+                            
+                            # Virtual Playhead syncing
+                            now = time.time()
+                            if not hasattr(self, '_playhead') or self._playhead < now:
+                                self._playhead = now
+                                
+                            self._reset_token = getattr(self, '_reset_token', 0) + 1
+                            current_token = self._reset_token
+                                
+                            delay_until_play = self._playhead - now
+                            self._playhead += duration
+                            
+                            emotions = VTUBE.detect_emotion(chunk)
+                            
+                            async def _sync_expression(em_list, delay_start, dur, token):
+                                try:
+                                    if delay_start > 0:
+                                        await asyncio.sleep(delay_start)
 
-                                await asyncio.sleep(dur + 0.3)
-                                if getattr(self, '_reset_token', -1) == token:
-                                    await asyncio.gather(
-                                        VTUBE.reset_to_neutral(),
-                                        BRIDGE.send_neutral(),
-                                    )
-                            except Exception as e:
-                                logger.debug(f"Sync error: {e}")
+                                    if em_list:
+                                        await asyncio.gather(
+                                            VTUBE.set_expression(em_list),
+                                            BRIDGE.send_expression(em_list, dur),
+                                        )
 
-                        asyncio.create_task(_sync_expression(emotions, delay_until_play, duration, current_token))
-                        output_emitter.push(pcm_bytes)
-                        logger.debug(f"Synthesized {duration:.2f}s for chunk: '{sentence[:50]}...'")
-                        
-                    except Exception as e:
-                        logger.error(f"TTS chunk generation failed: {e}")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                                    await asyncio.sleep(dur + 0.3)
+                                    if getattr(self, '_reset_token', -1) == token:
+                                        await asyncio.gather(
+                                            VTUBE.reset_to_neutral(),
+                                            BRIDGE.send_neutral(),
+                                        )
+                                except Exception as e:
+                                    logger.debug(f"Sync error: {e}")
+
+                            asyncio.create_task(_sync_expression(emotions, delay_until_play, duration, current_token))
+                            output_emitter.push(pcm_bytes)
+                            logger.debug(f"Synthesized {duration:.2f}s for chunk: '{sentence[:50]}...'")
+                            
+                        except Exception as e:
+                            logger.error(f"TTS chunk generation failed: {e}")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+            finally:
+                # FINAL RESET: Ensure avatar returns to neutral when AURA finishes the whole response
+                try:
+                    await asyncio.gather(
+                        VTUBE.reset_to_neutral(),
+                        BRIDGE.send_neutral(),
+                    )
+                    logger.debug("Final safety reset triggered.")
+                except: pass
 
         await asyncio.gather(_process_input(), _synthesize())

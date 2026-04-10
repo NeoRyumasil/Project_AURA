@@ -133,12 +133,23 @@ class OpenAICompatProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
 
         try:
-            async with self._async_client.chat.completions.stream(**kwargs) as stream:
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    if delta:
-                        assembled += delta
-                        yield TextDelta(text=delta)
+            response = await self._async_client.chat.completions.create(**kwargs, stream=True)
+            async for chunk in response:
+                if not chunk.choices:
+                    continue
+                
+                delta = chunk.choices[0].delta
+                
+                # Handle reasoning tokens (DeepSeek R1 / OpenRouter)
+                # These are internal thoughts we don't want to show the user
+                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if reasoning:
+                    continue
+
+                if delta.content:
+                    txt = delta.content
+                    assembled += txt
+                    yield TextDelta(text=txt)
         except Exception as e:
             logger.error(f"[{self.name}] stream error: {e}")
 

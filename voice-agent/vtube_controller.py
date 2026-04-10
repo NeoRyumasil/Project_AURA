@@ -434,10 +434,17 @@ class VTubeController:
         if not self.is_enabled or not self.connected:
             return
         
-        # Turn off all active expressions
+        # 1. Turn off all active expressions (hotkeys)
         for expr_name in list(self.active_expressions.keys()):
             await self._trigger_hotkey(expr_name)
         self.active_expressions.clear()
+
+        # 2. Reset all injected parameters to default values
+        for p_name in list(self.injected_parameters.keys()):
+            # Reset to a safe default (usually 1.0 for eyes, 0.0 for tongue/mouth)
+            default_val = 1.0 if "EyeOpen" in p_name else 0.0
+            await self.inject_parameter(p_name, default_val)
+        self.injected_parameters.clear()
     
     def detect_emotion(self, text):
         """Bilingual detection: Looks for explicit tags [tag1, tag2] first, then falls back to keywords."""

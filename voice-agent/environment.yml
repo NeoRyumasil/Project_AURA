@@ -28,4 +28,6 @@ dependencies:
       - livekit-plugins-cartesia
       - livekit-plugins-openai
       - livekit-api
+      - anthropic
+      - httpx
       - -e ./lib/faster-qwen3-tts

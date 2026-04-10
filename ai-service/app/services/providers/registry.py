@@ -18,6 +18,7 @@ Provider inference (when `provider` field is "auto" or missing):
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
 import random
 import time
@@ -64,7 +65,7 @@ class ProviderRegistry:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def generate(
+    async def generate(
         self,
         messages: list[dict],
         *,
@@ -116,7 +117,7 @@ class ProviderRegistry:
 
             logger.info(f"[registry] trying {provider_name} / {actual_model}")
             try:
-                result = self._call_with_retry(provider, messages, **call_kwargs)
+                result = await self._call_with_retry(provider, messages, **call_kwargs)
                 if provider_name != primary:
                     logger.warning(f"[registry] fell back to {provider_name} (primary={primary} failed)")
                 return result
@@ -147,7 +148,57 @@ class ProviderRegistry:
             "tool_calls": None,
         }
 
-    def _call_with_retry(self, provider: LLMProvider, messages: list[dict], **kwargs) -> dict:
+    async def stream(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict] | None = None,
+    ) -> AsyncGenerator[TextDelta | StreamDone, None]:
+        from app.services.settings_service import settings_service
+
+        db = settings_service.get_settings()
+        keys = settings_service.get_api_keys()
+
+        actual_model       = model or db.get("model") or "deepseek/deepseek-v3.2"
+        actual_temp        = temperature if temperature is not None else float(db.get("temperature", 0.8))
+        actual_max_tokens  = max_tokens or int(db.get("max_tokens", 300))
+
+        configured_provider = (db.get("provider") or "auto").lower()
+        primary = (
+            configured_provider
+            if configured_provider != "auto"
+            else infer_provider(actual_model)
+        )
+
+        candidates = [primary] + [
+            p for p in _FALLBACK_ORDER
+            if p != primary and (p == "ollama" or self._pick_key(p, keys))
+        ]
+
+        # Note: Fallbacks for streaming are harder to implement gracefully mid-stream.
+        # We try the primary and first available.
+        for provider_name in candidates:
+            try:
+                provider = self._get_provider(provider_name, keys)
+                logger.info(f"[registry] streaming {provider_name} / {actual_model}")
+                
+                async for chunk in provider.stream(
+                    messages,
+                    model=actual_model,
+                    temperature=actual_temp,
+                    max_tokens=actual_max_tokens,
+                    tools=tools
+                ):
+                    yield chunk
+                return
+            except Exception as e:
+                logger.warning(f"[registry] stream failed for {provider_name}: {e}")
+                continue
+
+    async def _call_with_retry(self, provider: LLMProvider, messages: list[dict], **kwargs) -> dict:
         """
         Call provider.generate() with exponential backoff on RetryableError.
         Raises RetryableError if all attempts fail.
@@ -155,7 +206,8 @@ class ProviderRegistry:
         """
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                return provider.generate(messages, **kwargs)
+                # Use thread pool for sync generate calls to keep registry async-friendly
+                return await asyncio.to_thread(provider.generate, messages, **kwargs)
             except NonRetryableError:
                 raise  # propagate immediately
             except RetryableError as e:
@@ -166,7 +218,7 @@ class ProviderRegistry:
                     f"[{provider.name}] attempt {attempt + 1}/{_MAX_ATTEMPTS} failed "
                     f"(status={e.status_code}): {e} — retrying in {delay:.1f}s"
                 )
-                time.sleep(delay)
+                await asyncio.sleep(delay)
 
     # ── Provider instantiation ────────────────────────────────────────────────
 
