@@ -54,8 +54,12 @@ export default function AdminPage() {
                 <StatusCards />
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
-                    <PersonalityTuner settings={settings} onUpdate={updateSettings} />
-                    <KnowledgeBase />
+                    <PersonalityTuner />
+                    
+                    <div className="flex flex-col gap-8">
+                        <ApiKeys />
+                        <KnowledgeBase />
+                    </div>
                 </div>
 
                 <SystemLogs />
