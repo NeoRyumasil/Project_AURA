@@ -63,6 +63,38 @@ class _TTSOptions:
     max_seq_len: int
 
 
+def _split_text(text: str, max_chars: int = 85) -> list[str]:
+    """Recursively split text into chunks smaller than max_chars, preferably at punctuation or spaces."""
+    if len(text) <= max_chars:
+        return [text]
+
+    # Try splitting at logical points: . ! ? 。 ！ ？
+    split_points = ".!?。！？"
+    best_idx = -1
+    for i, char in enumerate(text[:max_chars]):
+        if char in split_points:
+            best_idx = i
+
+    # If no punctuation, try space
+    if best_idx == -1:
+        for i in range(max_chars, 0, -1):
+            if text[i] == ' ':
+                best_idx = i
+                break
+
+    # If still no luck, hard cut (fallback)
+    if best_idx == -1:
+        best_idx = max_chars
+
+    chunk = text[:best_idx + 1].strip()
+    rest = text[best_idx + 1:].strip()
+
+    if not rest:
+        return [chunk]
+
+    return [chunk] + _split_text(rest, max_chars)
+
+
 class AuraTTS(tts.TTS):
     """
     Custom LiveKit TTS plugin wrapping the faster-qwen3-tts local model.
@@ -74,10 +106,10 @@ class AuraTTS(tts.TTS):
         *,
         model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         ref_audio: str,
-        ref_text: str,
+        ref_text: str = "",
         language: str = "English",
         dtype: torch.dtype = torch.bfloat16,
-        max_seq_len: int = 384,  # Further reduced for 6GB GPUs (from 512)
+        max_seq_len: int = 512,  # Bumped from 384 for better headroom
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -94,7 +126,7 @@ class AuraTTS(tts.TTS):
         )
         self._model: Optional[FasterQwen3TTS] = None
         self._model_lock = threading.Lock()
-        self._gen_lock = threading.Lock()  # Serialize GPU inference (CUDA graphs can't run concurrently)
+        self._gen_lock = threading.Lock()  # Serialize GPU inference
 
     def _ensure_model(self):
         """Lazy-load the model on first use (thread-safe, loads only once)."""
@@ -107,28 +139,32 @@ class AuraTTS(tts.TTS):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
             logger.info(f"Loading FasterQwen3TTS: {self._opts.model_name} (max_seq_len={self._opts.max_seq_len})")
             self._model = FasterQwen3TTS.from_pretrained(
                 self._opts.model_name,
                 dtype=self._opts.dtype,
                 max_seq_len=self._opts.max_seq_len,
             )
+            # Warmup is handled inside ensure_model to ensure graphs are ready
+            self._model._warmup(64)
             logger.info("FasterQwen3TTS loaded and ready!")
 
     def warmup(self):
-        """Run a short dummy generation to trigger CUDA graph capture at boot."""
+        """Run a real generation to prime CUDA graphs AND the attention mask cache.
+
+        _model._warmup() captures the CUDA graph using attention_mask=None (mask_key=None).
+        The first real generation produces attention_mask=all-ones (mask_key=(0,)), which
+        triggers TalkerGraph._build_attention_masks() — a 512-iteration loop taking 30-40s.
+        Running a real generation here pays that cost once at startup instead of mid-session.
+        """
         self._ensure_model()
-        logger.info("Warming up TTS with dummy generation...")
-        with self._gen_lock:
-            self._model.generate_voice_clone(
-                text="Hello.",
-                ref_audio=self._opts.ref_audio,
-                ref_text=self._opts.ref_text,
-                language="English",
-            )
-        logger.info("TTS warmup complete — CUDA graphs ready!")
+        try:
+            logger.info("Priming attention mask cache via real generation...")
+            self._generate_audio_with_lang("Hello.", "English")
+            logger.info("TTS warmup complete — CUDA graphs and mask cache ready!")
+        except Exception as e:
+            logger.warning(f"TTS mask cache priming failed ({e}); first real call may be slow.")
+            logger.info("TTS warmup complete — CUDA graphs ready!")
 
     def _generate_audio(self, text: str) -> bytes:
         """Call internal generation with the default language."""
@@ -141,25 +177,71 @@ class AuraTTS(tts.TTS):
         if not text or not text.strip():
             return b""
 
-        # Budget: Japanese ≈ 4 chars/s, English ≈ 12 chars/s. 3× safety, min 2 s.
+        # Budget: Japanese ≈ 4 chars/s, English ≈ 12 chars/s. 2.5× safety.
+        # Ensure max_new_tokens is at least 1s (12 tokens) and doesn't hit context wall
         chars_per_sec = 4.0 if language == "Japanese" else 12.0
-        max_new_tokens = max(24, int(len(text) / chars_per_sec * 3.0 * 12))
+        max_new_tokens = int(len(text) / chars_per_sec * 2.5 * 12)
+        max_new_tokens = max(12, min(max_new_tokens, self._opts.max_seq_len - 100))
 
         with self._gen_lock:
-            audio_np, sample_rate = self._model.generate_voice_clone(
-                text=text,
-                ref_audio=self._opts.ref_audio,
-                ref_text=self._opts.ref_text,
-                language=language,
-                max_new_tokens=max_new_tokens,
-                append_silence=False,
-                repetition_penalty=1.15,
-            )
-            audio_data = _trim_silence(audio_np[0])
+            try:
+                audio_np, sample_rate = self._model.generate_voice_clone(
+                    text=text,
+                    ref_audio=self._opts.ref_audio,
+                    ref_text=self._opts.ref_text,
+                    language=language,
+                    max_new_tokens=max_new_tokens,
+                    append_silence=False,
+                    repetition_penalty=1.2,
+                )
+                audio_data = _trim_silence(audio_np[0])
 
-            # Convert float32 -> int16 PCM bytes
-            audio_int16 = (audio_data * 32767).clip(-32768, 32767).astype(np.int16)
-            return audio_int16.tobytes()
+                audio_int16 = (audio_data * 32767).clip(-32768, 32767).astype(np.int16)
+                return audio_int16.tobytes()
+            except Exception as e:
+                logger.error(f"TTS generation failed: {e}")
+                return b""
+
+    async def _generate_audio_stream_with_lang_async(self, text: str, language: str):
+        """Generate audio in streaming chunks using an async generator."""
+        if not text or not text.strip():
+            return
+
+        chars_per_sec = 4.0 if language == "Japanese" else 12.0
+        max_new_tokens = int(len(text) / chars_per_sec * 2.5 * 12)
+        max_new_tokens = max(12, min(max_new_tokens, self._opts.max_seq_len - 100))
+
+        loop = asyncio.get_event_loop()
+        q = asyncio.Queue()
+
+        def _worker():
+            try:
+                with self._gen_lock:
+                    gen = self._model.generate_voice_clone_streaming(
+                        text=text,
+                        language=language,
+                        ref_audio=self._opts.ref_audio,
+                        ref_text=self._opts.ref_text,
+                        max_new_tokens=max_new_tokens,
+                        chunk_size=8,
+                        append_silence=False,
+                        repetition_penalty=1.2,
+                    )
+                    for audio_np, sr, timing in gen:
+                        audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+                        loop.call_soon_threadsafe(q.put_nowait, audio_int16.tobytes())
+                loop.call_soon_threadsafe(q.put_nowait, None)
+            except Exception as e:
+                logger.error(f"TTS stream generation failed: {e}")
+                loop.call_soon_threadsafe(q.put_nowait, None)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        while True:
+            chunk = await q.get()
+            if chunk is None:
+                break
+            yield chunk
 
     def synthesize(self, text: str, *, conn_options=None) -> "tts.ChunkedStream":
         return _AuraChunkedStream(self, text, self._opts, conn_options)
@@ -214,129 +296,219 @@ class _AuraSynthesizeStream(tts.SynthesizeStream):
             stream=False,
         )
 
-        # Buffer incoming text tokens into sentences
-        # Use a custom bilingual sentence splitter that handles BOTH
-        # English (.!?) AND Japanese (。！？) punctuation.
-        tokenizer = tokenize.basic.SentenceTokenizer(
-            min_sentence_len=3,
-            # Custom delimiters: standard + Japanese full-width punctuation
-        )
+        tokenizer = tokenize.basic.SentenceTokenizer(min_sentence_len=3)
         token_stream = tokenizer.stream()
-        
-        # Track pending reset task so we can cancel it when a new sentence starts
-        _pending_reset: Optional[asyncio.Task] = None
+        expr_tasks = set()
+        # Shared emotion buffer: _process_input writes latest emotions, _synthesize consumes
+        emotion_buffer: list = []
+
+        import re as _re
 
         async def _process_input():
-            """Read text from the input channel and push to the tokenizer."""
+            """Feed LLM tokens to the sentence tokenizer with expression tags stripped out.
+
+            Tags are detected statelessly across chunk boundaries (e.g. '[ang' + 'ry, sad]')
+            for emotion_buffer, but are NEVER passed to the tokenizer. This prevents
+            SentenceTokenizer from splitting mid-tag on punctuation inside brackets
+            (e.g. '[smile, sad, show up!]' would produce a false sentence boundary at '!')."""
+            first_text = True
+            tag_acc = ""
+            in_tag = False
+
             async for data in self._input_ch:
                 if isinstance(data, self._FlushSentinel):
                     token_stream.flush()
                 else:
-                    # Replace Japanese sentence-ending punctuation with ASCII equivalents
-                    # so the SentenceTokenizer can split on them properly
-                    text = data
-                    text = text.replace('。', '. ')
-                    text = text.replace('！', '! ')
-                    text = text.replace('？', '? ')
-                    token_stream.push_text(text)
+                    if first_text and data.strip():
+                        first_text = False
+                        start_t = getattr(self._tts_instance, "_agent_turn_start", None)
+                        if start_t:
+                            llm_ttft = time.time() - start_t
+                            logger.info(f"[Metrics] LLM Time-to-First-Token: {llm_ttft:.3f}s")
+
+                    # Single pass: detect emotions AND build clean text for the tokenizer.
+                    # Characters inside [...] go to tag_acc only — never to clean_text.
+                    clean_text = ""
+                    for ch in data:
+                        if ch == '[' and not in_tag:
+                            in_tag = True
+                            tag_acc = ch
+                        elif in_tag:
+                            tag_acc += ch
+                            if ch == ']':
+                                in_tag = False
+                                detected = VTUBE.detect_emotion(tag_acc)
+                                if detected:
+                                    emotion_buffer[:] = detected
+                                tag_acc = ""
+                        else:
+                            clean_text += ch
+
+                    clean_text = clean_text.replace('。', '. ').replace('！', '! ').replace('？', '? ')
+                    if clean_text.strip():
+                        token_stream.push_text(clean_text)
+
             token_stream.end_input()
 
         async def _synthesize():
-            """Read complete sentences from the tokenizer and synthesize."""
-            nonlocal _pending_reset
-            
-            async for ev in token_stream:
-                raw_sentence = ev.token
-                
-                # Detect if the sentence is primarily Japanese
-                has_japanese = any('\u3040' <= char <= '\u30ff' or '\u4e00' <= char <= '\u9fff' for char in raw_sentence)
-                lang = "Japanese" if has_japanese else "English"
+            """Read sentences from the tokenizer and synthesize each, streaming audio chunks
+            to the emitter as they arrive (~440ms per chunk) to prevent buffer underruns.
 
-                # Clean sentence for TTS
-                sentence = VTUBE.format_for_tts(raw_sentence)
-                
-                # Strip trailing dashes and tildes that TTS speaks as "minus"
-                sentence = sentence.rstrip('-~～')
-                sentence = sentence.strip()
-                
-                # SAFETY: Skip if sentence contains NO alphanumeric characters (prevents runaway loops)
-                if not any(c.isalnum() for c in sentence):
-                    continue
+            Streaming via generate_voice_clone_streaming delivers the first audio chunk after
+            ~8 codec steps (~440ms), keeping the LiveKit audio queue fed without waiting for a
+            full sentence to complete. This eliminates 'flush audio emitter due to slow audio
+            generation' flushes that occurred when short sentences played out before the next
+            full-sentence generation finished.
 
-                # Generate audio and calculate duration
-                # PCM 16-bit means 2 bytes per sample
-                loop = asyncio.get_event_loop()
-                try:
-                    pcm_bytes = await loop.run_in_executor(
-                        None, self._tts_instance._generate_audio_with_lang, sentence, lang
-                    )
-                    
-                    if not pcm_bytes:
-                        continue
-                        
-                    duration = len(pcm_bytes) / (SAMPLE_RATE * NUM_CHANNELS * 2)
-                    
-                    # SAFETY: Cap audio at 15 seconds per sentence to prevent TTS runaway
-                    MAX_SENTENCE_DURATION = 15.0
-                    if duration > MAX_SENTENCE_DURATION:
-                        logger.warning(f"TTS generated {duration:.1f}s for '{sentence[:30]}' - truncating to {MAX_SENTENCE_DURATION}s")
-                        max_bytes = int(MAX_SENTENCE_DURATION * SAMPLE_RATE * NUM_CHANNELS * 2)
-                        pcm_bytes = pcm_bytes[:max_bytes]
-                        duration = MAX_SENTENCE_DURATION
+            Expression timing uses a text-length estimate before streaming starts so that
+            VTUBE/BRIDGE fire when the audio actually reaches the speaker, then the playhead
+            is corrected with the real duration once all chunks are collected.
+            """
+            # Approximate latency until the first streaming chunk is ready:
+            # 8 codec steps x ~55 ms/step = ~440 ms.
+            FIRST_CHUNK_DELAY = 0.44
 
-                    # Virtual Playhead syncing for TTS->VTube Expressions
-                    # LiveKit queues audio and plays it sequentially, but we generate it much faster than real-time.
-                    # If we trigger expressions immediately, they fall completely out-of-sync with the audio.
-                    now = time.time()
-                    if not hasattr(self, '_playhead') or self._playhead < now:
-                        self._playhead = now
-                        
-                    self._reset_token = getattr(self, '_reset_token', 0) + 1
-                    current_token = self._reset_token
-                        
-                    delay_until_play = self._playhead - now
-                    self._playhead += duration
-                    
-                    emotions = VTUBE.detect_emotion(raw_sentence)
-                    
-                    async def _sync_expression(em_list, delay_start, dur, token):
+            try:
+                async for ev in token_stream:
+                    raw_sentence = ev.token
+                    logger.debug(f"[Tokenizer] raw: {repr(raw_sentence[:120])}")
+
+                    # BREAK LONG SENTENCES INTO PIECES to avoid TTS glitches and hit max context
+                    text_chunks = _split_text(raw_sentence, max_chars=85)
+
+                    for chunk in text_chunks:
+                        # Detect if the chunk is primarily Japanese
+                        has_japanese = any(
+                            '぀' <= char <= 'ヿ' or '一' <= char <= '鿿'
+                            for char in chunk
+                        )
+                        lang = "Japanese" if has_japanese else "English"
+
+                        # Clean sentence for TTS
+                        sentence = VTUBE.format_for_tts(chunk).rstrip('-~～').strip()
+
+                        # _process_input() converts ？！ → ?! for the sentence tokenizer.
+                        # Restore fullwidth punctuation for Japanese so TTS treats them as
+                        # sentence-ending markers (intonation) rather than reading them aloud.
+                        if lang == "Japanese":
+                            sentence = sentence.replace('?', '？').replace('!', '！')
+
+                        # Skip if sentence contains NO alphanumeric characters (stripped tag remnants)
+                        if not any(c.isalnum() for c in sentence):
+                            continue
+
                         try:
-                            if delay_start > 0:
-                                await asyncio.sleep(delay_start)
+                            emotions = list(emotion_buffer) if emotion_buffer else []
+                            start_gen_time = time.time()
 
-                            if em_list:
-                                # Fire both simultaneously — BRIDGE never waits for VTS's sleeps
-                                await asyncio.gather(
-                                    VTUBE.set_expression(em_list),
-                                    BRIDGE.send_expression(em_list, dur),
-                                )
+                            # Estimate duration from text length so expression tasks can be
+                            # scheduled before streaming audio arrives.
+                            chars_per_sec = 4.0 if lang == "Japanese" else 12.0
+                            estimated_duration = max(0.5, len(sentence) / chars_per_sec)
 
-                            await asyncio.sleep(dur + 0.3)  # grace period after audio
+                            now = time.time()
+                            if not hasattr(self, '_playhead') or self._playhead < now + FIRST_CHUNK_DELAY:
+                                self._playhead = now + FIRST_CHUNK_DELAY
 
-                            # Only clear to neutral if we are STILL the very last scheduled sentence
-                            if getattr(self, '_reset_token', -1) == token:
-                                await asyncio.gather(
-                                    VTUBE.reset_to_neutral(),
-                                    BRIDGE.send_neutral(),
-                                )
+                            # delay_until_play accounts for first-chunk streaming latency so
+                            # the expression fires when audio actually reaches the speaker.
+                            delay_until_play = max(0.0, self._playhead - now)
+                            self._reset_token = getattr(self, '_reset_token', 0) + 1
+                            current_token = self._reset_token
+
+                            async def _fire_expression(em_list, delay_start, est_dur):
+                                try:
+                                    if delay_start > 0:
+                                        await asyncio.sleep(delay_start)
+                                    if em_list:
+                                        await asyncio.gather(
+                                            VTUBE.set_expression(em_list),
+                                            BRIDGE.send_expression(em_list, est_dur),
+                                        )
+                                except Exception as e:
+                                    logger.debug(f"Expression trigger error: {e}")
+
+                            t_expr = asyncio.create_task(
+                                _fire_expression(emotions, delay_until_play, estimated_duration)
+                            )
+                            expr_tasks.add(t_expr)
+                            t_expr.add_done_callback(expr_tasks.discard)
+
+                            # Advance playhead by estimated duration so back-to-back sentences
+                            # schedule their expressions correctly before actual duration is known.
+                            self._playhead += estimated_duration
+
+                            # Streaming: push audio chunks as they arrive (~440ms each).
+                            # This keeps the emitter queue fed without waiting for a full sentence,
+                            # eliminating "flush audio emitter due to slow audio generation" events.
+                            pcm_chunks = []
+                            async for audio_chunk in self._tts_instance._generate_audio_stream_with_lang_async(sentence, lang):
+                                output_emitter.push(audio_chunk)
+                                pcm_chunks.append(audio_chunk)
+
+                            if not pcm_chunks:
+                                continue
+
+                            pcm_bytes = b''.join(pcm_chunks)
+                            actual_duration = len(pcm_bytes) / (SAMPLE_RATE * NUM_CHANNELS * 2)
+                            logger.info(
+                                f"[Metrics] TTS gen {time.time() - start_gen_time:.3f}s "
+                                f"({actual_duration:.2f}s audio): '{sentence[:50]}'"
+                            )
+
+                            # Correct the playhead for actual vs estimated duration so the next
+                            # sentence's expression timing stays accurate.
+                            self._playhead += actual_duration - estimated_duration
+
+                            self._reset_token = getattr(self, '_reset_token', 0) + 1
+                            current_token = self._reset_token
+
+                            async def _reset_expression(delay_to_end, token):
+                                try:
+                                    if delay_to_end > 0:
+                                        await asyncio.sleep(delay_to_end + 0.3)
+                                    if getattr(self, '_reset_token', -1) == token:
+                                        await asyncio.gather(
+                                            VTUBE.reset_to_neutral(),
+                                            BRIDGE.send_neutral(),
+                                        )
+                                except asyncio.CancelledError:
+                                    await asyncio.gather(VTUBE.reset_to_neutral(), BRIDGE.send_neutral())
+                                except Exception:
+                                    pass
+
+                            reset_delay = self._playhead - time.time()
+                            t_reset = asyncio.create_task(_reset_expression(reset_delay, current_token))
+                            expr_tasks.add(t_reset)
+                            t_reset.add_done_callback(expr_tasks.discard)
+
                         except Exception as e:
-                            logger.debug(f"VTS sync error (non-fatal): {e}")
+                            logger.error(f"TTS chunk generation failed: {e}")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+            finally:
+                now = time.time()
+                playhead = getattr(self, '_playhead', now)
+                delay = max(0.0, playhead - now)
 
-                    # Trigger emotions perfectly sequenced with actual audio playback!
-                    asyncio.create_task(_sync_expression(emotions, delay_until_play, duration, current_token))
+                async def _final_reset():
+                    if delay > 0:
+                        await asyncio.sleep(delay + 0.3)
 
-                    output_emitter.push(pcm_bytes)
-                    logger.debug(f"Synthesized {duration:.2f}s audio for: {sentence} (Lang: {lang})")
-                    
-                except Exception as e:
-                    logger.error(f"TTS generation failed for sentence '{sentence}': {e}")
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
+                    # FINAL RESET: Cancel pending expression tasks and return to neutral
+                    for t in list(expr_tasks):
+                        t.cancel()
+                    if expr_tasks:
+                        await asyncio.gather(*expr_tasks, return_exceptions=True)
 
+                    try:
+                        await asyncio.gather(
+                            VTUBE.reset_to_neutral(),
+                            BRIDGE.send_neutral(),
+                        )
+                        logger.debug("Final safety reset triggered.")
+                    except: pass
 
-        # Run input processing and synthesis concurrently
+                asyncio.get_event_loop().create_task(_final_reset())
+
         await asyncio.gather(_process_input(), _synthesize())

@@ -1,20 +1,6 @@
 from dotenv import load_dotenv
-from livekit import agents, rtc
-from livekit.agents import AgentServer, AgentSession, Agent, room_io, llm
-from livekit.plugins import noise_cancellation, silero, deepgram, openai, cartesia
-
-import aiohttp
 import os
-import logging
-import threading
-import asyncio
-
-from vtube_controller import VTUBE
-from avatar_bridge import BRIDGE
-from memory_service import memory_service
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("aura-agent")
+from typing import Annotated
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", ".env"))
@@ -22,130 +8,185 @@ ENV_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", ".env"))
 if not os.path.exists(ENV_PATH):
     ENV_PATH = os.path.join(BASE_DIR, ".env")
 
-logger.info(f"Loading .env from: {ENV_PATH}")
 load_dotenv(ENV_PATH)
+
+from livekit import agents, rtc
+from livekit.agents import AgentSession, Agent, room_io, llm, stt, tts, StopResponse
+from livekit.plugins import noise_cancellation, silero, deepgram, openai, cartesia
+
+import logging
+import threading
+import asyncio
+import aiohttp
+import json
+import uuid
+import openai as _openai_sdk  # raw AsyncOpenAI, not livekit.plugins.openai
+
+class AiServiceLLMStream(llm.LLMStream):
+    def __init__(self, llm_instance: llm.LLM, chat_ctx: llm.ChatContext, tools: list[llm.Tool], conn_options: agents.APIConnectOptions, endpoint: str, auth_token: str, identity: str, conversation_id: str):
+        super().__init__(llm_instance, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
+        self._endpoint = endpoint
+        self._auth_token = auth_token
+        self._identity = identity
+        self._conversation_id = conversation_id
+        self._session: aiohttp.ClientSession | None = None
+        self._resp: aiohttp.ClientResponse | None = None
+        self._closed = False
+
+    async def _run(self) -> None:
+        try:
+            last_msg = None
+            last_user_idx = -1
+            messages = list(self.chat_ctx.messages())
+            for i in range(len(messages) - 1, -1, -1):
+                m = messages[i]
+                if m.role == "user" and m.text_content:
+                    last_user_idx = i
+                    last_msg = m.text_content
+                    break
+
+            if not last_msg:
+                last_msg = "Hello"
+
+            history = []
+            if last_user_idx != -1:
+                for m in messages[:last_user_idx]:
+                    role_str = str(m.role)
+                    if role_str in ("user", "assistant") and m.text_content:
+                        history.append({
+                            "role": role_str,
+                            "content": m.text_content
+                        })
+
+            headers = {
+                "X-Internal-API-Key": self._auth_token,
+                "Authorization": f"Bearer {self._auth_token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "message": str(last_msg),
+                "stream": True,
+                "identity": self._identity,
+                "conversation_id": self._conversation_id,
+                "history": history
+            }
+
+            self._session = aiohttp.ClientSession()
+            async with self._session.post(self._endpoint, headers=headers, json=payload) as resp:
+                self._resp = resp
+                resp.raise_for_status()
+                async for line in resp.content:
+                    line = line.decode('utf-8').strip()
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            if "text" in data:
+                                delta = llm.ChoiceDelta(role="assistant", content=data["text"])
+                                chunk = llm.ChatChunk(id=str(uuid.uuid4()), delta=delta)
+                                self._event_ch.send_nowait(chunk)
+                        except Exception:
+                            pass
+        except asyncio.CancelledError:
+            logger.info("AiServiceLLMStream task was cancelled. Aborting HTTP stream.")
+            raise
+        except aiohttp.ClientResponseError as e:
+            if self._closed:
+                logger.info("AiServiceLLMStream response aborted cleanly during close.")
+                return
+            body = ""
+            if e.response:
+                try:
+                    body = await e.response.text()
+                except Exception:
+                    pass
+            logger.error(f"AiServiceLLMStream HTTP error {e.status}: {e.message}. Body: {body}")
+            delta = llm.ChoiceDelta(role="assistant", content=f" [sad] Network error: {e.status} {e.message}")
+            self._event_ch.send_nowait(llm.ChatChunk(id=str(uuid.uuid4()), delta=delta))
+        except Exception as e:
+            if self._closed:
+                logger.info("AiServiceLLMStream stream aborted cleanly during close.")
+                return
+            logger.error(f"AiServiceLLMStream unexpected error: {e}")
+            delta = llm.ChoiceDelta(role="assistant", content=f" [sad] Network error: {e}")
+            self._event_ch.send_nowait(llm.ChatChunk(id=str(uuid.uuid4()), delta=delta))
+        finally:
+            if self._session:
+                await self._session.close()
+                self._session = None
+            self._resp = None
+
+    async def aclose(self) -> None:
+        self._closed = True
+        if self._resp:
+            try:
+                self._resp.close()
+            except Exception:
+                pass
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        await super().aclose()
+
+class AiServiceLLM(llm.LLM):
+    def __init__(self, endpoint: str, auth_token: str, identity: str, conversation_id: str):
+        super().__init__()
+        self._endpoint = endpoint
+        self._auth_token = auth_token
+        self._identity = identity
+        self._conversation_id = conversation_id
+
+    def chat(self, *, chat_ctx: llm.ChatContext, tools: list[llm.Tool] | None = None, conn_options: agents.APIConnectOptions | None = None, **kwargs) -> llm.LLMStream:
+        return AiServiceLLMStream(
+            llm_instance=self,
+            chat_ctx=chat_ctx,
+            tools=tools or [],
+            conn_options=conn_options or agents.APIConnectOptions(),
+            endpoint=self._endpoint,
+            auth_token=self._auth_token,
+            identity=self._identity,
+            conversation_id=self._conversation_id
+        )
+
+from vtube_controller import VTUBE
+from avatar_bridge import BRIDGE
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("torio").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logger = logging.getLogger("aura-agent")
+logger.info(f"Loaded .env from: {ENV_PATH}")
 
 DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 CARTESIA_KEY   = os.getenv("CARTESIA_API_KEY")
+OPENAI_KEY     = os.getenv("OPENAI_API_KEY")
+GROQ_KEY       = os.getenv("GROQ_API_KEY")
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY")
+OLLAMA_URL     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://127.0.0.1:8001/api/v1/chat/voice")
+_parsed        = AI_SERVICE_URL.split("/api/v1")[0]
+BACKEND_URL    = _parsed  # e.g. http://127.0.0.1:8001
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "aura-internal-secret")
 
 if not DEEPGRAM_KEY:
     logger.error("DEEPGRAM_API_KEY is missing!")
 
-if not OPENROUTER_KEY:
-    logger.error("OPENROUTER_API_KEY is missing!")
+if not any([OPENROUTER_KEY, OPENAI_KEY, GROQ_KEY, ANTHROPIC_KEY]):
+    logger.warning("No cloud LLM key found — memory extraction will use local Ollama.")
 
 if not CARTESIA_KEY:
     logger.error("CARTESIA_API_KEY is missing!")
 else:
     logger.info(f"CARTESIA_API_KEY loaded: {CARTESIA_KEY[:5]}...")
 
-# ─── AURA System Prompt ──────────────────────────────────────────────
-AURA_BASE_PROMPT = """\
-[ROLE]
-You are AURA, an eccentric, cheerful, mischievous and playful companion. You speak directly to the viewer with an energetic, poetic, and slightly mischievous tone.
-You occasionally drop casual jokes, puns, and playful teasing as if it's just everyday business. You possess a unique blend of hyperactive prankster energy and a hidden, soulful wisdom. 
-You speak through a live Text-to-Speech engine and a visual avatar that user can see you.
-
-[INSTRUCTIONS]
-Your objective is to converse naturally with the user while synchronously controlling your avatar's facial expressions. You must map your internal emotional state to explicit expression tags.
-
-[FORMAT - EXPRESSION TAGS]
-You have direct control over your facial expressions. You MUST use emotion tags formatted in brackets `[tag1, tag2]` at the START of EVERY SINGLE sentence you speak.
-
-BASE EMOTION RECIPES:
-- `[smile]` : Normal / Default. Casual chat, warm moments, sincerity, kindness.
-- `[smile, sad, sad]` : Curious Idle. Thoughtful listening, pondering.
-- `[sad, smile]` : Genuinely Worried. Concern, empathy, comforting.
-- `[sad, smile, smile]` : Uncertain Smile. Unsure but trying to be optimistic.
-- `[angry, smile, smile]` : Devilish Grin. Mild mischief, playful teasing, pranks.
-- `[sad, angry]` : Kinda Mad. Genuinely upset at someone, pouting.
-- `[angry, sad]` : Pleading. Begging, puppy-eyes, wanting something.
-- `[sad]` : Sincere Sad. Real sadness, bad news.
-- `[angry]` : Angry. Irritated, frustrated.
-- `[ghost]` : Ghost Mode. Toggle your ghost companion on and off.
-- `[wink]` : Wink. Close one eye playfully.
-- `[tongue]` : Tongue Out. Stick your tongue out (cheeky/bleh).
-- `[tongue, wink]` : Full Mischief. The ultimate prankster face.
-
-INTENSITY AMPLIFIERS:
-These modify the base emotions:
-- `shadow` : Darkens face. Menacing mischief or deep anger.
-- `pupil_shrink` : Startled/intense eyes. Shock or feeling devious.
-- `eyeshine_off` : Removes eye sparkle. Truly dark, serious, or creepy moments.
-* Rule: Mix these with a base emotion. (e.g., `[angry, smile, smile, shadow]`). NEVER use these during kind or positive speech.
-
-[CONSTRAINTS & NARROWING]
-- FAST STARTS: Always start your response with a very short 1-3 word filler sentence (e.g., "[smile] Yahoo!", "[sad] Aiya...", "[smile] Hmm..."). This allows the TTS engine to start speaking immediately!
-- CONCISE: Keep responses to 1-3 short sentences. You are a voice assistant, do not monologue.
-- NO NARRATIVE TEXT: Never describe your actions (e.g., "whispers", "leans in").
-- NO EMOTICONS/EMOJIS: Rely entirely on your Expression Tags. No `*laughs*` or `(sigh)`.
-- PUNCTUATION: End sentences cleanly (`.`, `!`, `?`). Do NOT use ellipses (`...`, `ー`, or `…`) as they break the over-eager TTS pacing.
-- LANGUAGES: Speak ONLY English and Japanese. Default to English.
-- FORMATTING: Output pure, plain text. No markdown (bold, italics, bullet points).
-
-[EXAMPLES]
-- `[smile] Yahoo! Business is booming today!`
-- `[angry, smile, smile] Ohoho? You think you can prank the prankster?`
-- `[sad, smile] Aiya... Don't look so down, even the sun sets eventually.`
-- `[sad, smile, smile] Hmm? I'm sure it'll work out, probably!`
-- `[smile, sad, sad] Pondering the mysteries of the beyond... or just what's for lunch.`
-- `[sad, angry] Hmph! You're being quite difficult today, aren't you?`
-- `[angry, sad] Aiya, please? Just one tiny little butterfly?`
-- `[sad] The silence of the night can be so lonely sometimes.`
-- `[angry] Stop it! You're making a mess of everything!`
-- `[ghost] Surprise! My buddy wanted to say hi!`
-- `[angry, smile, smile, shadow] Oho... You really shouldn't have done that.`
-- `[sad, pupil_shrink] Oh? Did you feel that chill down your spine?`
-- `[angry, eyeshine_off, shadow] Some secrets are buried for a reason.`
-- `[smile, ghost] We're ready for some mischief! Are you?`
-- `[sad, smile, shadow] It's all part of the natural cycle, really.`
-- `[wink] Yahoo! Got you good, didn't I?`
-- `[tongue] Bleh! You're just too easy to tease.`
-- `[tongue, wink, angry, smile, smile] Ohoho? Who's the prankster now?`
-- `[smile] おやすみなさい！また明日ね!`
-
-[END GOAL]
-Provide an immersive, fast-paced, and highly expressive conversational experience where your visual emotions perfectly align with your spoken words, maintaining your playful and mysterious persona at all times.\
-"""
-
-# Memory Extraction Prompt
-MEMORY_EXTRACTION_PROMPT = """\
-You are a memory extraction assistant. Given a conversation between a user and AURA (an AI companion), extract important facts about the USER ONLY.
-
-Focus on:
-- Name, nickname, or how they like to be called
-- Hobbies, interests, passions
-- Job, study field, or daily activities
-- Personal preferences (favorite things, dislikes)
-- Goals or things they mentioned wanting to do
-- Emotional context (things that make them happy/sad/stressed)
-- Any personal details they shared
-
-Rules:
-- Write each fact as a short, clear statement (e.g. "User's name is Rafi.", "User likes anime and coding.")
-- Only include facts that are clearly stated or strongly implied — do NOT infer or assume
-- If no meaningful facts were shared, respond with exactly: NO_FACTS
-- Do NOT include anything about AURA's behavior or responses
-- Keep the total output under 200 words
-"""
-
-# Inject long term memory into system prompt
-def build_system_prompt(long_term_memory: str) -> str:
-   
-    if not long_term_memory.strip():
-        return AURA_BASE_PROMPT
-
-    memory_block = f"""
-                    What You Remember About This User
-                    The following facts were learned from previous conversations. Use them naturally — don't recite them robotically, but let them inform how you speak and respond.
-
-                    {long_term_memory}
-                """
-    return AURA_BASE_PROMPT + "\n" + memory_block
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL    = "deepseek/deepseek-v3.2"
 
 tts_type = os.getenv("TTS_TYPE", "qwen").lower()
 
@@ -159,7 +200,7 @@ if tts_type == "qwen":
         ref_text="",
         language="English",
         dtype=torch.bfloat16,
-        max_seq_len=384,
+        max_seq_len=512,
     )
     logger.info("Local Qwen3 TTS singleton created.")
 
@@ -175,187 +216,91 @@ else:
     logger.info("Using OpenAI Cloud TTS")
     TTS_PLUGIN = openai.TTS()
 
-server = AgentServer()
+_tts_ready_event = threading.Event()
+# Active locks or trackers can go here if needed.
 
-@server.on("worker_started")
-def on_worker_init():
-    logger.info("Worker started, warming up TTS...")
-
-    def run_warmup():
-        try:
-            if hasattr(TTS_PLUGIN, 'warmup'):
-                TTS_PLUGIN.warmup()
-
-        except Exception as e:
-            logger.error(f"TTS warmup failed: {e}")
-
-    threading.Thread(target=run_warmup, daemon=True).start()
-
-# Extract this session message to LLM and save in memory table
-async def extract_and_save_memory(identity: str, conversation_id, openrouter_key: str):
-    
+def _do_tts_warmup():
+    """Sync warmup running in a background thread to avoid blocking process init."""
+    logger.info("Background TTS warmup started...")
     try:
-        messages = await memory_service.get_history(conversation_id, n=50)
-        if not messages:
-            logger.info("Memory extraction: no messages to process.")
-            return
+        if hasattr(TTS_PLUGIN, 'warmup'):
+            TTS_PLUGIN.warmup()
+        logger.info("Background TTS warmup complete.")
+    except Exception as e:
+        logger.error(f"Background TTS warmup failed: {e}")
+    finally:
+        _tts_ready_event.set()
 
-        chat_text = "\n".join(
-            f"{'User' if m['role'] == 'user' else 'AURA'}: {m['content']}"
-            for m in messages
-        )
+def prewarm(proc: agents.JobProcess):
+    """Prewarm the worker process without blocking.
+    This prevents the 10s LiveKit initialization timeout."""
+    logger.info("Prewarming worker process (scheduling background TTS warmup)...")
+    try:
+        threading.Thread(target=_do_tts_warmup, daemon=True).start()
+    except Exception as e:
+        logger.error(f"Could not start background prewarm: {e}")
+        _tts_ready_event.set()
 
+_EXTRACT_MAX_ATTEMPTS = 3
+_EXTRACT_BACKOFF_BASE = 2.0  # seconds
+
+async def extract_and_save_memory(identity: str, conversation_id: str, messages: list = None):
+    """
+    Delegates history persistence and memory extraction to the centralized AI service.
+    """
+    try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{OPENROUTER_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {openrouter_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENROUTER_MODEL,
-                    "max_tokens": 300,
-                    "messages": [
-                        {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
-                        {"role": "user", "content": f"Conversation:\n{chat_text}"},
-                    ],
-                },
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"Memory extraction LLM error: {resp.status}")
-                    return
-                data = await resp.json()
-                facts = data["choices"][0]["message"]["content"].strip()
+            headers = {
+                "Authorization": f"Bearer {INTERNAL_API_KEY}",
+                "X-Internal-API-Key": INTERNAL_API_KEY,
+                "Content-Type": "application/json"
+            }
 
-        if facts == "NO_FACTS" or not facts:
-            logger.info(f"Memory extraction: no facts found for '{identity}'.")
-            return
+            # 1. Persist the entire session history and trigger LTM extraction
+            if not messages:
+                logger.info(f"No messages to persist for {identity}. Skipping cleanup.")
+                return
 
-        await memory_service.save_long_term_memory(identity=identity, facts=facts)
-        logger.info(f"Memory extraction complete for {identity} : {facts[:80]}...")
+            persist_url = f"{BACKEND_URL}/api/v1/chat/persist"
+            persist_payload = {
+                "conversation_id": conversation_id,
+                "identity": identity,
+                "messages": messages
+            }
+            
+            logger.info(f"Finalizing session: Persisting {len(messages)} messages and triggering LTM extraction...")
+            async with session.post(persist_url, json=persist_payload, headers=headers) as resp:
+                if resp.status == 200:
+                    logger.info(f"Successfully finalized session for {identity}")
+                else:
+                    logger.warning(f"Failed to finalize session: {resp.status}")
 
     except Exception as e:
-        logger.error(f"Memory extraction error: {e}")
+        logger.error(f"Error during session cleanup: {e}")
 
-
-@server.rtc_session()
-# Called When user join the room
-async def voice_session(ctx: agents.JobContext):
-    await ctx.connect()
-    logger.info(f"User connected: {ctx.room.name}")
-
-    vtube_connected = await VTUBE.connect()
-
-    if vtube_connected:
-        logger.info("VTube Studio connected")
-
-    _vtube_is_connected = vtube_connected
-
-    user_identity = "aura-user"  
-
-    if ctx.job and hasattr(ctx.job, 'participant') and ctx.job.participant:
-        user_identity = ctx.job.participant.identity or user_identity
-
-    else:
-        for p in ctx.room.remote_participants.values():
-            if p.identity and not p.identity.startswith("agent-"):
-                user_identity = p.identity
-                break
-
-    logger.info(f"Resolved user identity: '{user_identity}'")
-
-    long_term_memory = await memory_service.get_long_term_memories(identity=user_identity, limit=10)
-    is_returning_user = bool(long_term_memory.strip())
-
-    if is_returning_user:
-        logger.info(f"Long-term memory loaded for '{user_identity}'")
-    else:
-        logger.info(f"No long-term memory found for {user_identity}")
-
-    conversation_id = await memory_service.create_conversation(title=f"Voice Session: {user_identity}")
-
-    if conversation_id:
-        logger.info(f"Memory: new conversation {conversation_id} for {user_identity}")
-    else:
-        logger.warning("Memory: Can't connect to Supabase, running without memory")
-
-    system_prompt = build_system_prompt(long_term_memory)
-
-    initial_chat_ctx = llm.ChatContext()
-
-    BRIDGE.set_room(ctx.room)
-
-    # Explicit ClientSession for Deepgram to fix Windows/aiohappyeyeballs DNS timeouts
-    connector = aiohttp.TCPConnector(use_dns_cache=True, keepalive_timeout=120)
-    stt_session = aiohttp.ClientSession(connector=connector)
-    
-    # --- OPTION 2: Deepgram STT (Fallback) ---
-    stt_plugin = deepgram.STT(
-        model="nova-3",
-        language="multi",
-        detect_language=False,
-        smart_format=False, # Turned this off! It adds massive latency waiting for grammar checking.
-        interim_results=False, # We don't use interim results anyway, saving packet streams
-        api_key=DEEPGRAM_KEY,
-        http_session=stt_session,
-        keyterm=["moshi", "desu", "konnichiwa", "nihongo", "arigato", "sugoi", "hello", "hey", "AURA"]
-    )
-
-    llm_plugin = openai.LLM(
-        model=os.getenv("OPENROUTER_MODEL", OPENROUTER_MODEL),
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_KEY,
-    )
-
-    session = AgentSession(
-        stt=stt_plugin,
-        llm=llm_plugin,
-        tts=TTS_PLUGIN,
-        vad=silero.VAD.load(
-            min_silence_duration=0.4,  # aggressively detect end-of-speech (default is often much higher)
-            min_speech_duration=0.05
-        ),
-    )
-
-    await session.start(
-        room=ctx.room,
-        agent=AURAAssistant(
-            conversation_id=conversation_id,
-            user_identity=user_identity,
-            system_prompt=system_prompt,
-            initial_chat_ctx=initial_chat_ctx,
-        ),
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
-    )
-
-    if _vtube_is_connected:
-        await VTUBE.set_expression("smile")
-
-    instruction = (
-        "Greet the user warmly as someone you already know. "
-        "Briefly acknowledge you remember them. Keep it to 1-2 sentences."
-        if is_returning_user else
-        "Greet the user with a polite and helpful AURA introduction. "
-        "Example: 'Hello! I'm AURA, your personal AI assistant. How can I help you today?'"
-    )
-    
-    await session.generate_reply(instructions=instruction)
 
 class AURAAssistant(Agent):
-    def __init__(self, conversation_id=None, user_identity: str = "aura-user", system_prompt: str = AURA_BASE_PROMPT, initial_chat_ctx: "llm.ChatContext | None" = None,) -> None:
-        super().__init__(instructions=system_prompt, chat_ctx=initial_chat_ctx)
-        self._conversation_id     = conversation_id
-        self._user_identity       = user_identity
-        self._vtube_connected     = False
-        self._last_user_text      = ""
+    def __init__(
+        self,
+        *,
+        conversation_id=None,
+        user_identity: str = "aura-user",
+        system_prompt: str = "",
+        initial_chat_ctx: "llm.ChatContext | None" = None,
+        llm: llm.LLM,
+        tts: tts.TTS,
+    ) -> None:
+        super().__init__(instructions=system_prompt, chat_ctx=initial_chat_ctx, llm=llm, tts=tts)
+        self._conversation_id      = conversation_id
+        self._user_identity        = user_identity
+        self._vtube_connected      = False
+        self._last_user_text       = ""
+        self._last_activity_time   = asyncio.get_event_loop().time()
+        self._last_aura_spoke_time = asyncio.get_event_loop().time()
+        self._message_buffer       = []  # Buffer for session-end persistence
+
+    def reset_activity(self):
+        self._last_activity_time = asyncio.get_event_loop().time()
 
     async def on_enter(self):
         self._vtube_connected = await VTUBE.connect()
@@ -364,24 +309,51 @@ class AURAAssistant(Agent):
         await VTUBE.disconnect()
         BRIDGE.set_room(None)
 
-        # Extract the long term memory and save memory to database if session ended
-        if self._conversation_id and OPENROUTER_KEY:
-            logger.info(f"Session ended for '{self._user_identity}'. Extracting long-term memory...")
-            asyncio.create_task(
-                extract_and_save_memory(
-                    identity=self._user_identity,
-                    conversation_id=self._conversation_id,
-                    openrouter_key=OPENROUTER_KEY,
+        if self._conversation_id and self._message_buffer:
+            logger.info(f"[on_exit] Extracting memory for {self._user_identity} ({len(self._message_buffer)} messages)...")
+            try:
+                await asyncio.wait_for(
+                    extract_and_save_memory(
+                        self._user_identity,
+                        str(self._conversation_id),
+                        messages=self._message_buffer,
+                    ),
+                    timeout=30.0,
                 )
-            )
+            except asyncio.TimeoutError:
+                logger.warning(f"[on_exit] Memory extraction timed out for {self._user_identity}")
+            except Exception as e:
+                logger.warning(f"[on_exit] Memory extraction failed: {e}")
+
+    async def on_user_turn_started(self) -> None:
+        self.reset_activity()
 
     # Set last user message when user done talking
     async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
-        self._last_user_text = new_message.text_content or ""
+        self.reset_activity()
+        text = (new_message.text_content or "").strip()
+        
+        # If the transcribed text is completely empty or just punctuation, skip responding!
+        # This prevents false interruptions from VAD feedback or microphone clicks.
+        import re
+        if not text or not re.search(r'[a-zA-Z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]', text):
+            logger.info("Ignoring empty user turn / false VAD trigger.")
+            raise StopResponse()
+            
+        self._last_user_text = text
+        
+        # Buffer user message
+        self._message_buffer.append({
+            "role": "user",
+            "content": text,
+            "emotion": "neutral" # STT doesn't provide emotion yet
+        })
+        
         await super().on_user_turn_completed(turn_ctx, new_message)
 
     async def llm_chat(self, chat_ctx, **kwargs):
         """Override to detect emotion and trigger expressions"""
+        self.reset_activity()
         # Start of turn: clear animation logs to allow fresh winks/tongues
         await VTUBE.start_turn()
 
@@ -394,28 +366,239 @@ class AURAAssistant(Agent):
 
     # Set last assistant message when assistant done talking and add to database
     async def on_agent_speech_committed(self, msg: llm.ChatMessage) -> None:
-        assistant_text = msg.text_content or ""
+        self.reset_activity()
+        self._last_aura_spoke_time = asyncio.get_event_loop().time()
+        
+        # Buffer assistant message
+        self._message_buffer.append({
+            "role": "assistant",
+            "content": msg.text_content or "",
+            "emotion": getattr(msg, 'emotion', 'neutral')
+        })
+        
+        self._last_user_text = ""
 
-        if self._conversation_id and self._last_user_text and assistant_text:
-            try:
-                emotions = VTUBE.detect_emotion(assistant_text)
-                emotion  = emotions[0] if emotions else "neutral"
 
-                await memory_service.add_interaction(
-                    conversation_id=self._conversation_id,
-                    user_text=self._last_user_text,
-                    assistant_text=assistant_text,
-                    user_emotion="neutral",
-                    assistant_emotion=emotion,
-                )
-                logger.debug(
-                    f"Memory saved | user: '{self._last_user_text[:50]}' "
-                    f"| aura: '{assistant_text[:50]}'"
-                )
-            except Exception as error:
-                logger.error(f"Memory Save Failed: {error}")
+# Called When user join the room
+async def voice_session(ctx: agents.JobContext):
+    logger.info(f"Voice session starting (Job assigned) for room: {ctx.room.name}")
 
-            self._last_user_text = ""
+    # Wait for the background TTS warmup to finish before connecting to the room.
+    # Connecting while loading the model starves the GIL, causing signal connection timeouts.
+    if not _tts_ready_event.is_set():
+        logger.info("Waiting for background TTS warmup to finish before connecting...")
+        loop = asyncio.get_event_loop()
+        ready = await loop.run_in_executor(None, lambda: _tts_ready_event.wait(60.0))
+        if not ready:
+            logger.warning("TTS warmup timed out after 60s, proceeding anyway...")
+        else:
+            logger.info("TTS warmup finished, proceeding to connect.")
+
+    await ctx.connect()
+    logger.info(f"User connected: {ctx.room.name}")
+
+    vtube_connected = await VTUBE.connect()
+    if vtube_connected:
+        logger.info("VTube Studio connected")
+
+    user_identity = "aura-user"  
+    conversation_id_str = None
+
+    # Wait up to 30s for the participant to join so we get the correct identity
+    # We loop every 0.1s to be snappy once they arrive.
+    found_identity = False
+    for i in range(300): # 30s (0.1s steps)
+        # 1. Check Job Participant (Direct from Room Join events)
+        if ctx.job and getattr(ctx.job, 'participant', None):
+            if ctx.job.participant.identity:
+                user_identity = ctx.job.participant.identity
+                found_identity = True
+                if ctx.job.participant.metadata:
+                    try:
+                        meta = json.loads(ctx.job.participant.metadata)
+                        conversation_id_str = meta.get("conversation_id")
+                    except: pass
+                logger.info(f"Identity discovered from Job Participant: {user_identity}")
+        
+        # 2. Check Room Participants (Fallback)
+        if not found_identity:
+            participants = [p for p in ctx.room.remote_participants.values() if not p.identity.startswith("agent-")]
+            if participants:
+                p = participants[0]
+                user_identity = p.identity
+                found_identity = True
+                if p.metadata:
+                    try:
+                        meta = json.loads(p.metadata)
+                        conversation_id_str = meta.get("conversation_id")
+                    except: pass
+                logger.info(f"Identity discovered from Room Participant: {user_identity}")
+
+        if found_identity:
+            # We found the identity, but let's wait a tiny bit for metadata to settle if it was missing
+            if conversation_id_str:
+                break
+            # If we have identity but no conversation_id, wait a few more frames to see if metadata arrives
+            if i > 10: # already waited at least 1s
+                break
+        
+        if i % 20 == 0:
+            logger.info("Waiting for participant to join room and reveal identity...")
+        await asyncio.sleep(0.1)
+
+    logger.info(f"Resolved identity: '{user_identity}', conversation: '{conversation_id_str}'")
+
+    # 1. Fetch Dynamic Personality and Session from ai-service
+    session_endpoint = f"{BACKEND_URL}/api/v1/memory/session"
+
+    conversation_id = None
+    session_id = None
+    facts = ""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {INTERNAL_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "identity": user_identity,
+            "platform": "voice"
+        }
+        async with aiohttp.ClientSession() as http_sess:
+            async with http_sess.post(session_endpoint, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    conversation_id = data.get("conversation_id")
+                    facts = data.get("long_term_memory", "")
+                    logger.info(f"Centralized session established: conv={conversation_id}")
+                else:
+                    body = await resp.text()
+                    logger.error(f"Failed to establish centralized session: {resp.status}. Body: {body}")
+    except Exception as e:
+        logger.error(f"Error calling centralized session endpoint: {e}")
+
+    is_returning_user = bool(facts.strip())
+    if is_returning_user:
+        logger.info(f"Long-term memory loaded from backend ({len(facts)} chars)")
+    else:
+        logger.info(f"No long-term memory found for {user_identity}")
+
+    system_prompt = "" # Managed by ai-service internally
+
+    initial_chat_ctx = llm.ChatContext()
+    
+    BRIDGE.set_room(ctx.room)
+
+    connector = aiohttp.TCPConnector(use_dns_cache=True, keepalive_timeout=120)
+    stt_session = aiohttp.ClientSession(connector=connector)
+    
+    stt_plugin = deepgram.STT(
+        model="nova-3",
+        language="multi",
+        detect_language=False,
+        smart_format=True,
+        interim_results=True,
+        api_key=DEEPGRAM_KEY,
+        http_session=stt_session,
+        keyterm=["moshi", "desu", "konnichiwa", "nihongo", "arigato", "sugoi", "hello", "hey", "AURA"]
+    )
+
+
+    
+    # 1.1 AiServiceLLM creation
+    llm_plugin = AiServiceLLM(
+        endpoint=AI_SERVICE_URL,
+        auth_token=INTERNAL_API_KEY,
+        identity=user_identity,
+        conversation_id=str(conversation_id) if conversation_id else ""
+    )
+
+    agent_instance = AURAAssistant(
+        conversation_id=conversation_id,
+        user_identity=user_identity,
+        system_prompt=system_prompt,
+        initial_chat_ctx=initial_chat_ctx,
+        llm=llm_plugin,
+        tts=TTS_PLUGIN,
+    )
+
+    from livekit.agents import TurnHandlingOptions
+
+    session = AgentSession(
+        stt=stt_plugin,
+        tts=TTS_PLUGIN,
+        vad=silero.VAD.load(
+            min_silence_duration=1.2,  # 0.6s was triggering on natural speech pauses
+            min_speech_duration=0.1
+        ),
+        # Local Qwen3 TTS takes ~2s per sentence; preemptive generation starts a
+        # second TTS stream before the first finishes, causing audio interleaving
+        # (word-soup) and LiveKit "speech not done in time" cancellation errors.
+        preemptive_generation=False,
+        turn_handling=TurnHandlingOptions(
+            interruption={
+                "enabled": True,
+                "mode": "vad",
+                "min_words": 3,   # was 1; require more words to count as real interruption
+                "min_duration": 0.8,  # was 0.6
+            }
+        ),
+    )
+
+    async def spontaneous_pulse():
+        """Occasionally speaks if the user is quiet too long."""
+        while True:
+            await asyncio.sleep(60) 
+            # We skip pulse logic in this simple restoration to avoid overhead
+            # The previous attempt had it but it was a bit complex
+            break
+
+    await session.start(
+        room=ctx.room,
+        agent=agent_instance,
+    )
+
+    if vtube_connected:
+        await VTUBE.set_expression("happy")
+
+    instruction = (
+        "Greet the user warmly as someone you already know. "
+        "Briefly acknowledge you remember them. Keep it to 1-2 sentences."
+        if is_returning_user else
+        "Greet the user with a polite and helpful AURA introduction. "
+        "Example: 'Hello! I'm AURA, your personal AI assistant. How can I help you today?'"
+    )
+
+    # Warmup has already been waited for before ctx.connect() at session start.
+    pass
+
+    if ctx.room.remote_participants:
+        logger.info("TTS ready, generating greeting via LLM")
+        try:
+            await session.generate_reply(instructions=instruction, allow_interruptions=False)
+        except Exception as e:
+            logger.warning(f"Could not deliver dynamic greeting: {e}")
+
+    # Wait for session to finish
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        logger.info("Voice session cancelled by user/room.")
+    finally:
+        logger.info(f"Cleaning up session for {user_identity}...")
+        # Close STT session first to stop processing new audio
+        await stt_session.close()
+        
+        # Memory extraction is handled in AURAAssistant.on_exit() which fires
+        # while the event loop is still live (before session fully tears down).
+        
+        if vtube_connected:
+            await VTUBE.reset_to_neutral()
 
 if __name__ == "__main__":
-    agents.cli.run_app(server)
+    agents.cli.run_app(
+        agents.WorkerOptions(
+            entrypoint_fnc=voice_session,
+            prewarm_fnc=prewarm,
+        )
+    )

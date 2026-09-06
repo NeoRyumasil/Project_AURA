@@ -32,13 +32,16 @@ class TokenHandler(BaseHTTPRequestHandler):
             if not room:
                 room = f"aura-room-{int(time.time())}"
             identity = params.get("identity", ["aura-user"])[0]
+            conversation_id = params.get("conversation_id", [None])[0]
 
-            token = (
-                AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-                .with_identity(identity)
+            token_builder = AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
+                .with_identity(identity) \
                 .with_grants(VideoGrants(room_join=True, room=room))
-                .to_jwt()
-            )
+            
+            if conversation_id:
+                token_builder.with_metadata(json.dumps({"conversation_id": conversation_id}))
+
+            token = token_builder.to_jwt()
 
             payload = json.dumps({
                 "token": token,
@@ -77,6 +80,6 @@ class TokenHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"🔑 AURA Token Server running on http://localhost:{PORT}")
+    print(f"[TokenServer] AURA Token Server running on http://localhost:{PORT}")
     print(f"   LiveKit URL: {LIVEKIT_URL}")
     HTTPServer(("0.0.0.0", PORT), TokenHandler).serve_forever()

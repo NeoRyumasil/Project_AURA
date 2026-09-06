@@ -8,3 +8,6 @@ class BrainState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
     emotion: str
     conversation_id: str
+    identity: str
+    stream: bool
+    mode: str  # "text" or "voice" — controls which system prompt template is used
