@@ -5,12 +5,15 @@ import logging
 import asyncio
 from pypdf import PdfReader
 from uuid import UUID
+
 from app.models.chat import SessionRequest, SessionResponse, MemoryExtractionRequest
 from app.api.v1.chat import verify_internal_api_key
+
 from core.services.memory import memory_service
 from core.services.prompter import prompter
 from core.services.llm import llm_service
 from core.services.settings import settings_service
+from core.services.summarizer import summarizer_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -114,3 +117,21 @@ async def get_history(conversation_id: str, n: int = 50, _ = Depends(verify_inte
     except Exception as e:
         logger.error(f"Error fetching history for {conversation_id}: {e}")
         return {"history": []}
+
+@router.post("/summarize/{conversation_id}")
+async def summarize_chat(conversation_id: str, _ = Depends(verify_internal_api_key)):
+    try:
+        conv_uuid = UUID(conversation_id)
+        
+        summary = await summarizer_service.summarize_interaction(conv_uuid)
+        
+        if "Summarization Fail" in summary or "Nothing" in summary or "Invalid ID" in summary :
+            return {"status": "skipped", "reason": summary}
+            
+        return {"status": "success", "summary": summary}
+        
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Conversation ID")
+    except Exception as e:
+        logger.error(f"Error Calls Summarizer on {conversation_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Fail to Summarize Conversation")
